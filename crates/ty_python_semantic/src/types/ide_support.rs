@@ -1,17 +1,22 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::FxIndexSet;
-use crate::place::implicit_builtins_symbol_scope;
-use crate::reachability::is_range_reachable;
+use crate::place::{Definedness, class_body_implicit_symbol, implicit_builtins_symbol_scope};
+use crate::place_load::{
+    ImplicitPlaceLoad, PlaceLoad, PlaceLoadFallbacks, PlaceLoadMode, PlaceLoadSource,
+    PlaceLoadSourceKind, resolve_place_load,
+};
+use crate::reachability::{ReachabilityConstraintsExtension, is_range_reachable};
 use crate::types::call::bind::CheckTypesMode;
 use crate::types::call::{CallArguments, CallError, MatchedArgument};
 use crate::types::class::{DynamicClassAnchor, DynamicEnumAnchor, DynamicNamedTupleAnchor};
 use crate::types::constraints::ConstraintSetBuilder;
+use crate::types::infer::TypeExpressionFlags;
 use crate::types::signatures::{ParametersKind, Signature};
 use crate::types::{
     CallDunderError, CallableTypes, ClassBase, ClassLiteral, ClassType, KnownClass, KnownFunction,
     KnownUnion, PropertyAccessorRole, SubclassOfInner, Type, TypeContext,
-    TypeVarBoundOrConstraints, binding_type,
+    TypeVarBoundOrConstraints, binding_type, infer_complete_scope_types,
 };
 use crate::{Db, DisplaySettings, HasDefinition, HasType, ProgramEnvironment, SemanticModel};
 use itertools::Either;
@@ -22,8 +27,14 @@ use ruff_python_ast::{self as ast, AnyNodeRef, name::Name};
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::FxHashSet;
 use ty_module_resolver::{ImportingFile, Module, ResolverFile};
-use ty_python_core::definition::{Definition, DefinitionKind, NestedBindingExecution};
-use ty_python_core::{ProgramFile, attribute_scopes, global_scope, semantic_index, use_def_map};
+use ty_python_core::definition::{
+    Definition, DefinitionKind, DefinitionState, NestedBindingExecution,
+};
+use ty_python_core::place::PlaceExpr;
+use ty_python_core::{
+    BindingWithConstraintsIterator, BoundnessAnalysis, ProgramFile, Truthiness, attribute_scopes,
+    global_scope, place_table, semantic_index, use_def_map,
+};
 
 mod unreachable_code;
 #[path = "ide_support/unused_bindings.rs"]
@@ -33,6 +44,256 @@ pub use resolve_definition::{ImportAliasResolution, ResolvedDefinition, map_stub
 use resolve_definition::{find_symbol_in_scope, resolve_definition};
 pub use unreachable_code::{UnreachableKind, UnreachableRange, unreachable_ranges};
 pub use unused_binding_support::{UnusedBinding, unused_bindings};
+
+impl<'db> SemanticModel<'db> {
+    /// Resolves the user-visible definitions that can supply a name's value.
+    ///
+    /// The result follows the same lexical lookup as type inference. It is
+    /// [`RefactorBindingResolution::Unrepresentable`] when a possible provider is synthetic or the
+    /// lookup crosses an explicit `global` or `nonlocal` declaration.
+    ///
+    /// For `pkg.member`, calling this with `pkg` returns the bindings for the local name `pkg`,
+    /// such as `import pkg`. Use [`Self::module_attribute_bindings`] to find the bindings for
+    /// `member` inside `pkg`.
+    pub fn name_use_bindings(&self, name: &ast::ExprName) -> RefactorBindingResolution<'db> {
+        let Some(file_scope) = self.scope(name.into()) else {
+            return RefactorBindingResolution::Unrepresentable;
+        };
+        let index = semantic_index(self.db(), self.program_file());
+        let scope = file_scope.to_scope_id(self.db(), self.program_file());
+        let place = PlaceExpr::from_expr_name(name);
+        let mode = if self.is_in_string_annotation() {
+            PlaceLoadMode::StringAnnotation
+        } else if infer_complete_scope_types(self.db(), scope)
+            .type_expression_flags(ast::ExprRef::Name(name))
+            .contains(TypeExpressionFlags::DEFERRED_NAME_RESOLUTION)
+        {
+            PlaceLoadMode::Deferred
+        } else {
+            PlaceLoadMode::AtExpression(name.into())
+        };
+        let load = resolve_place_load(self.db(), index, scope, (&place).into(), mode);
+
+        if load.scope_declarations.is_empty() {
+            project_place_load(self.db(), &self.program_environment(), &load)
+        } else {
+            RefactorBindingResolution::Unrepresentable
+        }
+    }
+
+    /// Returns the bindings live at the end of the module that defines an attribute.
+    ///
+    /// For `pkg.member`, this returns the bindings for `member` at the end of `pkg`. Use
+    /// [`Self::name_use_bindings`] to inspect the local binding of `pkg` at the access site.
+    ///
+    /// Returns [`RefactorBindingResolution::Unrepresentable`] if the attribute has no source-backed
+    /// module or a possible provider cannot be expressed as a user-visible definition.
+    pub fn module_attribute_bindings(
+        &self,
+        attribute: &ast::ExprAttribute,
+    ) -> RefactorBindingResolution<'db> {
+        let Some(Type::ModuleLiteral(module)) = attribute.value.inferred_type(self) else {
+            return RefactorBindingResolution::Unrepresentable;
+        };
+
+        let Some(file) = module.module(self.db()).file(self.db()) else {
+            return RefactorBindingResolution::Unrepresentable;
+        };
+        let file = ProgramFile::new(
+            self.db(),
+            file,
+            self.program_environment().program(self.db()),
+        );
+        let scope = global_scope(self.db(), file);
+        let Some(symbol) = place_table(self.db(), scope).symbol_id(attribute.attr.as_str()) else {
+            return RefactorBindingResolution::Undefined;
+        };
+        let use_def = use_def_map(self.db(), scope);
+        project_bindings(self.db(), use_def.end_of_scope_symbol_bindings(symbol))
+    }
+
+    /// Returns the inferred value type supplied by a definition.
+    ///
+    /// Definitions in [`RefactorBindingResolution`] may belong to a different file from this
+    /// model. For example, [`Self::module_attribute_bindings`] for `pkg.member` in a file named
+    /// `use.py` can return the definition of `member` from `pkg/__init__.py`; this method evaluates
+    /// that definition in its own file.
+    pub fn binding_type(&self, definition: Definition<'db>) -> Type<'db> {
+        crate::types::binding_type(self.db(), definition)
+    }
+}
+
+/// The user-visible binding definitions available to a refactoring.
+pub enum RefactorBindingResolution<'db> {
+    /// The place has no definition.
+    Undefined,
+    /// Every possible provider is represented by a user-visible definition.
+    Defined {
+        /// Definitions that can supply the value.
+        binding_definitions: Box<[Definition<'db>]>,
+        /// Whether at least one reachable path leaves the place undefined.
+        definedness: Definedness,
+    },
+    /// At least one possible provider cannot be represented safely for refactoring.
+    Unrepresentable,
+}
+
+impl<'db> RefactorBindingResolution<'db> {
+    fn or_fall_back_to(self, fallback: impl FnOnce() -> RefactorBindingResolution<'db>) -> Self {
+        let Self::Defined {
+            binding_definitions,
+            definedness: Definedness::PossiblyUndefined,
+        } = self
+        else {
+            return match self {
+                Self::Undefined => fallback(),
+                Self::Defined { .. } | Self::Unrepresentable => self,
+            };
+        };
+
+        match fallback() {
+            Self::Undefined => Self::Defined {
+                binding_definitions,
+                definedness: Definedness::PossiblyUndefined,
+            },
+            Self::Defined {
+                binding_definitions: fallback_definitions,
+                definedness,
+            } => {
+                let mut definitions = FxIndexSet::from_iter(binding_definitions);
+                definitions.extend(fallback_definitions);
+                Self::Defined {
+                    binding_definitions: definitions.into_iter().collect(),
+                    definedness,
+                }
+            }
+            Self::Unrepresentable => Self::Unrepresentable,
+        }
+    }
+}
+
+fn project_place_load<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    load: &PlaceLoad<'db>,
+) -> RefactorBindingResolution<'db> {
+    let PlaceLoadFallbacks::Unconditional { lexical, .. } = load.fallbacks() else {
+        return RefactorBindingResolution::Unrepresentable;
+    };
+    load.local_sources()
+        .iter()
+        .chain(lexical)
+        .fold(RefactorBindingResolution::Undefined, |resolved, source| {
+            resolved.or_fall_back_to(|| project_place_load_source(db, env, source))
+        })
+}
+
+fn project_place_load_source<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    source: &PlaceLoadSource<'db>,
+) -> RefactorBindingResolution<'db> {
+    if source.is_class_body_global_fallback() {
+        return RefactorBindingResolution::Unrepresentable;
+    }
+
+    match &source.kind {
+        PlaceLoadSourceKind::Bindings(bindings) => project_bindings(db, bindings.clone()),
+        PlaceLoadSourceKind::DefinitionsFromOwningScope { scope, id } => {
+            project_bindings(db, use_def_map(db, *scope).reachable_bindings(*id))
+        }
+        PlaceLoadSourceKind::Implicit(ImplicitPlaceLoad::DunderClass(definition)) => {
+            project_implicit_definition(db, *definition)
+        }
+        PlaceLoadSourceKind::Implicit(ImplicitPlaceLoad::ClassBodySymbol(name)) => {
+            if class_body_implicit_symbol(db, env, name).is_undefined() {
+                RefactorBindingResolution::Undefined
+            } else {
+                RefactorBindingResolution::Unrepresentable
+            }
+        }
+        PlaceLoadSourceKind::Implicit(ImplicitPlaceLoad::ExplicitGlobalSymbol { file, name }) => {
+            let scope = global_scope(db, *file);
+            let table = place_table(db, scope);
+            let Some(symbol) = table.symbol_id(name) else {
+                return RefactorBindingResolution::Undefined;
+            };
+            project_bindings(db, use_def_map(db, scope).reachable_symbol_bindings(symbol))
+        }
+    }
+}
+
+fn project_implicit_definition<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+) -> RefactorBindingResolution<'db> {
+    if definition.kind(db).is_user_visible() {
+        RefactorBindingResolution::Defined {
+            binding_definitions: Box::new([definition]),
+            definedness: Definedness::AlwaysDefined,
+        }
+    } else {
+        RefactorBindingResolution::Unrepresentable
+    }
+}
+
+fn project_bindings<'db>(
+    db: &'db dyn Db,
+    bindings: BindingWithConstraintsIterator<'_, 'db>,
+) -> RefactorBindingResolution<'db> {
+    let boundness_analysis = bindings.boundness_analysis();
+    let predicates = bindings.predicates();
+    let constraints = bindings.reachability_constraints();
+    let mut definitions = FxIndexSet::default();
+    let mut unbound_reachability = Truthiness::AlwaysFalse;
+    let mut deleted_reachability = Truthiness::AlwaysFalse;
+    let mut has_unrepresentable_definition = false;
+
+    for binding in bindings {
+        let reachability = constraints.evaluate(db, predicates, binding.reachability_constraint);
+        if reachability.is_always_false() {
+            continue;
+        }
+
+        match binding.binding {
+            DefinitionState::Defined(definition) if definition.kind(db).is_user_visible() => {
+                definitions.insert(definition);
+            }
+            DefinitionState::Defined(_) => has_unrepresentable_definition = true,
+            DefinitionState::Deleted => {
+                deleted_reachability = deleted_reachability.or(reachability);
+            }
+            DefinitionState::Undefined => {
+                unbound_reachability = unbound_reachability.or(reachability);
+            }
+        }
+    }
+
+    if deleted_reachability.is_always_true() {
+        return RefactorBindingResolution::Undefined;
+    }
+    if has_unrepresentable_definition {
+        return RefactorBindingResolution::Unrepresentable;
+    }
+    if definitions.is_empty() {
+        return RefactorBindingResolution::Undefined;
+    }
+
+    let possibly_undefined = deleted_reachability.is_ambiguous()
+        || matches!(
+            boundness_analysis,
+            BoundnessAnalysis::BasedOnUnboundVisibility
+        ) && !unbound_reachability.is_always_false();
+
+    RefactorBindingResolution::Defined {
+        binding_definitions: definitions.into_iter().collect(),
+        definedness: if possibly_undefined {
+            Definedness::PossiblyUndefined
+        } else {
+            Definedness::AlwaysDefined
+        },
+    }
+}
 
 /// Get the primary definition kind for a name expression within a specific file.
 /// Returns the first definition kind that is reachable for this name in its scope.
@@ -3114,11 +3375,23 @@ pub fn constructor_signature(model: &SemanticModel, call_expr: &ast::ExprCall) -
 
 #[cfg(test)]
 mod tests {
-    use super::{CallArgumentForm, call_argument_forms, contains_identifier};
+    use std::fmt::Write as _;
+
+    use super::{
+        CallArgumentForm, RefactorBindingResolution, call_argument_forms, contains_identifier,
+    };
     use crate::SemanticModel;
-    use crate::db::tests::TestDbBuilder;
-    use ruff_db::files::system_path_to_file;
+    use crate::db::tests::{TestDb, TestDbBuilder};
+    use crate::types::Type;
+    use anyhow::{Context, anyhow, bail, ensure};
+    use insta::assert_snapshot;
+    use ruff_db::diagnostic::{
+        Annotation, Diagnostic, DiagnosticId, DisplayDiagnosticConfig, DisplayDiagnostics, Severity,
+    };
+    use ruff_db::files::{FileRange, system_path_to_file};
     use ruff_db::parsed::parsed_module;
+    use ruff_python_ast::{self as ast, AnyNodeRef, find_node::covering_node};
+    use ruff_text_size::{TextRange, TextSize};
     use ty_python_core::ProgramFile;
 
     #[test]
@@ -3130,6 +3403,242 @@ mod tests {
         for (source, name) in [("exclude = 10", "x"), ("Database", "Base"), ("", "x")] {
             assert!(!contains_identifier(source, name));
         }
+    }
+
+    #[test]
+    fn name_use_bindings_ignore_later_conditional_bindings() -> anyhow::Result<()> {
+        let source = r#"
+import first as value
+before = value<CURSOR>
+if flag:
+    import second as value
+"#;
+
+        assert_snapshot!(
+            render_name_use_bindings_at_cursor(source)?,
+            @"
+        info[live-binding]: Candidate definition
+         --> src/foo.py:2:8
+          |
+        2 | import first as value
+          |        ^^^^^^^^^^^^^^
+
+        definedness: AlwaysDefined
+        "
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn name_use_bindings_track_end_of_control_flow() -> anyhow::Result<()> {
+        let source = r#"
+import sys
+import first as value
+if flag:
+    import second as value
+elif remove:
+    del value
+elif sys.version_info < (3, 0):
+    import never as value
+after = value<CURSOR>
+"#;
+
+        assert_snapshot!(
+            render_name_use_bindings_at_cursor(source)?,
+            @"
+        info[live-binding]: Candidate definition
+         --> src/foo.py:3:8
+          |
+        3 | import first as value
+          |        ^^^^^^^^^^^^^^
+
+        info[live-binding]: Candidate definition
+         --> src/foo.py:5:12
+          |
+        5 |     import second as value
+          |            ^^^^^^^^^^^^^^^
+
+        definedness: PossiblyUndefined
+        "
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn name_use_bindings_reject_global_declarations() -> anyhow::Result<()> {
+        let source = r#"
+import other
+
+def declared():
+    global other
+    return other<CURSOR>
+"#;
+
+        assert_snapshot!(
+            render_name_use_bindings_at_cursor(source)?,
+            @"Unrepresentable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn name_use_bindings_preserve_unbound_lazy_locals() -> anyhow::Result<()> {
+        let source = r#"
+import other
+
+def lazy():
+    before = value<CURSOR>
+    value = other
+"#;
+
+        assert_snapshot!(
+            render_name_use_bindings_at_cursor(source)?,
+            @"Undefined"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn name_use_bindings_reject_non_shadowing_synthetic_bindings() -> anyhow::Result<()> {
+        let source = r#"
+while True:
+    value<CURSOR>
+    import other as value
+"#;
+
+        assert_snapshot!(
+            render_name_use_bindings_at_cursor(source)?,
+            @"Unrepresentable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn name_use_bindings_fall_back_in_string_annotations() -> anyhow::Result<()> {
+        let source = r#"
+import other
+
+def annotated():
+    value: "other<CURSOR>.C"
+"#;
+
+        assert_snapshot!(
+            render_name_use_bindings_at_cursor(source)?,
+            @"
+        info[live-binding]: Candidate definition
+         --> src/foo.py:2:8
+          |
+        2 | import other
+          |        ^^^^^
+
+        definedness: AlwaysDefined
+        "
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn name_use_bindings_resolve_deferred_annotations_at_end_of_scope() -> anyhow::Result<()> {
+        let source = r#"
+from __future__ import annotations
+import first as value
+annotation: value<CURSOR>.C
+import second as value
+"#;
+
+        assert_snapshot!(
+            render_name_use_bindings_at_cursor(source)?,
+            @"
+        info[live-binding]: Candidate definition
+         --> src/foo.py:3:8
+          |
+        3 | import first as value
+          |        ^^^^^^^^^^^^^^
+
+        info[live-binding]: Candidate definition
+         --> src/foo.py:5:8
+          |
+        5 | import second as value
+          |        ^^^^^^^^^^^^^^^
+
+        definedness: AlwaysDefined
+        "
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn module_attribute_bindings_report_end_state() -> anyhow::Result<()> {
+        let use_source = "import pkg\nresult = pkg.current<CURSOR>\n";
+        let package_source = r#"
+from . import stale as current
+if bool(input()):
+    from . import first as current
+else:
+    from . import second as current
+"#;
+
+        assert_snapshot!(
+            render_module_attribute_bindings_at_cursor(use_source, package_source)?,
+            @"
+        info[live-binding]: Candidate definition
+         --> src/pkg/__init__.py:4:19
+          |
+        4 |     from . import first as current
+          |                   ^^^^^^^^^^^^^^^^
+
+        info[live-binding]: Candidate definition
+         --> src/pkg/__init__.py:6:19
+          |
+        6 |     from . import second as current
+          |                   ^^^^^^^^^^^^^^^^^
+
+        definedness: AlwaysDefined
+        "
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn binding_type_evaluates_cross_file_definitions() -> anyhow::Result<()> {
+        let use_source = r#"
+import pkg
+result = pkg.current<CURSOR>"
+"#;
+        let package_source = "from . import target as current\n";
+
+        let (use_source, cursor) = extract_cursor(use_source)?;
+        let db = TestDbBuilder::new()
+            .with_file("/src/pkg/__init__.py", package_source)
+            .with_file("/src/pkg/target.py", "")
+            .with_file("/src/use.py", &use_source)
+            .build()?;
+        let (model, resolution) = module_attribute_bindings_at_cursor(&db, cursor)?;
+        let RefactorBindingResolution::Defined {
+            binding_definitions,
+            ..
+        } = resolution
+        else {
+            bail!("expected `pkg.current` to have defined bindings");
+        };
+        let [definition] = binding_definitions.as_ref() else {
+            bail!(
+                "expected one definition for `pkg.current`, got {}",
+                binding_definitions.len()
+            );
+        };
+        assert_ne!(definition.file(model.db()), model.file());
+
+        let Type::ModuleLiteral(module) = model.binding_type(*definition) else {
+            bail!("expected `pkg.current` to be bound to a module");
+        };
+        assert_eq!(
+            module.module(model.db()).name(model.db()).as_str(),
+            "pkg.target"
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -3413,5 +3922,159 @@ cast(*args)
         );
 
         Ok(())
+    }
+
+    fn render_bindings<'db>(
+        model: &SemanticModel<'db>,
+        resolution: &RefactorBindingResolution<'db>,
+    ) -> anyhow::Result<String> {
+        let (binding_definitions, definedness) = match resolution {
+            RefactorBindingResolution::Undefined => return Ok("Undefined\n".to_string()),
+            RefactorBindingResolution::Unrepresentable => {
+                return Ok("Unrepresentable\n".to_string());
+            }
+            RefactorBindingResolution::Defined {
+                binding_definitions,
+                definedness,
+            } => (binding_definitions, definedness),
+        };
+
+        let db = model.db();
+        let mut definitions = binding_definitions
+            .iter()
+            .map(|definition| {
+                let definition = *definition;
+                let python_file = definition.python_file(db);
+                let file = python_file.file(db);
+                let parsed = parsed_module(db, python_file).load(db);
+                let range = definition.kind(db).full_range(&parsed);
+                (file.path(db).to_string(), range, file)
+            })
+            .collect::<Vec<_>>();
+        definitions.sort_by(|(left_path, left_range, _), (right_path, right_range, _)| {
+            left_path
+                .cmp(right_path)
+                .then_with(|| left_range.start().cmp(&right_range.start()))
+        });
+
+        let diagnostics = definitions
+            .into_iter()
+            .map(|(_, range, file)| {
+                let mut diagnostic = Diagnostic::new(
+                    DiagnosticId::lint("live-binding"),
+                    Severity::Info,
+                    "Candidate definition",
+                );
+                diagnostic.annotate(Annotation::primary(FileRange::new(file, range).into()));
+                diagnostic
+            })
+            .collect::<Vec<_>>();
+        let resolver: &dyn ruff_db::Db = db;
+        let mut rendered = DisplayDiagnostics::new(
+            &resolver,
+            &DisplayDiagnosticConfig::new("ty").context(0),
+            &diagnostics,
+        )
+        .to_string();
+        writeln!(&mut rendered, "definedness: {definedness:?}")
+            .context("writing binding metadata should succeed")?;
+
+        Ok(rendered.replace('\\', "/"))
+    }
+
+    fn render_name_use_bindings_at_cursor(source: &str) -> anyhow::Result<String> {
+        let (source, cursor) = extract_cursor(source)?;
+        let db = TestDbBuilder::new()
+            .with_file("/src/foo.py", &source)
+            .build()?;
+
+        let file = system_path_to_file(&db, "/src/foo.py").context("test file should exist")?;
+        let file = ProgramFile::new(&db, file, db.program_environment().program(&db));
+        let parsed = parsed_module(&db, file.python_file(&db)).load(&db);
+        let model = SemanticModel::new(&db, file);
+        let expression = expression_at_cursor(parsed.syntax().into(), cursor)?;
+
+        match expression {
+            ast::ExprRef::Name(name) => {
+                let resolution = model.name_use_bindings(name);
+                render_bindings(&model, &resolution)
+            }
+            ast::ExprRef::StringLiteral(annotation) => {
+                let (annotation, annotation_model) = model
+                    .enter_string_annotation(annotation)
+                    .context("cursor should be inside a string annotation")?;
+                let ast::ExprRef::Name(name) =
+                    expression_at_cursor(annotation.syntax().into(), cursor)?
+                else {
+                    bail!("expected the cursor to select a name inside the string annotation");
+                };
+                let resolution = annotation_model.name_use_bindings(name);
+                render_bindings(&annotation_model, &resolution)
+            }
+            expression => bail!("expected the cursor to select a name, got {expression:?}"),
+        }
+    }
+
+    fn render_module_attribute_bindings_at_cursor(
+        use_source: &str,
+        package_source: &str,
+    ) -> anyhow::Result<String> {
+        let (use_source, cursor) = extract_cursor(use_source)?;
+        let db = TestDbBuilder::new()
+            .with_file("/src/pkg/__init__.py", package_source)
+            .with_file("/src/use.py", &use_source)
+            .build()?;
+        let (model, resolution) = module_attribute_bindings_at_cursor(&db, cursor)?;
+        render_bindings(&model, &resolution)
+    }
+
+    fn module_attribute_bindings_at_cursor(
+        db: &TestDb,
+        cursor: TextSize,
+    ) -> anyhow::Result<(SemanticModel<'_>, RefactorBindingResolution<'_>)> {
+        let file = system_path_to_file(db, "/src/use.py").context("test use file should exist")?;
+        let file = ProgramFile::new(db, file, db.program_environment().program(db));
+        let parsed = parsed_module(db, file.python_file(db)).load(db);
+        let model = SemanticModel::new(db, file);
+        let ast::ExprRef::Attribute(attribute) =
+            expression_at_cursor(parsed.syntax().into(), cursor)?
+        else {
+            bail!("expected the cursor to select an attribute expression");
+        };
+        let resolution = model.module_attribute_bindings(attribute);
+
+        Ok((model, resolution))
+    }
+
+    fn expression_at_cursor(
+        root: AnyNodeRef<'_>,
+        offset: TextSize,
+    ) -> anyhow::Result<ast::ExprRef<'_>> {
+        covering_node(root, TextRange::empty(offset))
+            .find_first(AnyNodeRef::is_expression)
+            .map_err(|node| {
+                anyhow!(
+                    "expected an expression at the cursor, got {:?}",
+                    node.node()
+                )
+            })?
+            .node()
+            .as_expr_ref()
+            .context("covering node should be an expression")
+    }
+
+    fn extract_cursor(source: &str) -> anyhow::Result<(String, TextSize)> {
+        const MARKER: &str = "<CURSOR>";
+
+        let Some((before, after)) = source.split_once(MARKER) else {
+            bail!("cursor source should contain a `{MARKER}` marker");
+        };
+        ensure!(
+            !after.contains(MARKER),
+            "cursor source should contain exactly one `{MARKER}` marker"
+        );
+
+        let offset = TextSize::try_from(before.len()).context("test source is too large")?;
+        Ok(([before, after].concat(), offset))
     }
 }

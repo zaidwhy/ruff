@@ -35,9 +35,12 @@ pub(crate) use implicit_globals::{
     module_type_implicit_global_declaration, module_type_implicit_global_symbol,
 };
 
+/// Whether a place is defined on every reachable control-flow path.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, get_size2::GetSize)]
-pub(crate) enum Definedness {
+pub enum Definedness {
+    /// The place is defined on every reachable path.
     AlwaysDefined,
+    /// The place is undefined on at least one possible path.
     PossiblyUndefined,
 }
 
