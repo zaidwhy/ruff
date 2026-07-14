@@ -5153,6 +5153,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     callable.signatures(db),
                     kind,
                     provenance,
+                    callable.top_materialization_for_narrowing(db),
                 ))),
                 Type::Union(union) => union.try_map(db, env, |element| {
                     propagate_callable_kind(db, env, *element, kind, provenance)
@@ -6402,7 +6403,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     .with_definition(signature.definition())
                 }),
             );
-            CallableType::new(db, signatures, callable.kind(db), callable.provenance(db))
+            CallableType::new(
+                db,
+                signatures,
+                callable.kind(db),
+                callable.provenance(db),
+                callable.top_materialization_for_narrowing(db),
+            )
         });
         let inferable = class_generic_context.inferable_typevars(db);
         let constraints = ConstraintSetBuilder::new();
@@ -8358,6 +8365,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             CallableSignature::single(Signature::new(parameters, return_ty)),
             CallableTypeKind::FunctionLike,
             CallableFunctionProvenance::ImplicitReturn,
+            false,
         ))
     }
 
@@ -8450,6 +8458,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     CallableSignature::from_overloads(getitem_overloads),
                     CallableTypeKind::FunctionLike,
                     CallableFunctionProvenance::None,
+                    false,
                 ),
             )],
         );
