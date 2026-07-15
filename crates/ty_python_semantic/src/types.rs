@@ -4,7 +4,7 @@ use ruff_diagnostics::{Edit, Fix};
 use rustc_hash::FxHashMap;
 
 use std::borrow::Cow;
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::iter;
 use std::rc::Rc;
 use std::time::Duration;
@@ -435,8 +435,16 @@ impl<'env, 'db> ApplyTypeMappingVisitor<'env, 'db> {
         func: impl FnOnce() -> Type<'db>,
     ) -> Type<'db> {
         let type_transformer = match type_mapping {
-            TypeMapping::Materialize(MaterializationKind::Top) => &self.top_materialization,
-            TypeMapping::Materialize(MaterializationKind::Bottom) => &self.bottom_materialization,
+            TypeMapping::Materialize(MaterializationKind::Top)
+            | TypeMapping::MaterializeOnce {
+                materialization_kind: MaterializationKind::Top,
+                ..
+            } => &self.top_materialization,
+            TypeMapping::Materialize(MaterializationKind::Bottom)
+            | TypeMapping::MaterializeOnce {
+                materialization_kind: MaterializationKind::Bottom,
+                ..
+            } => &self.bottom_materialization,
             TypeMapping::ApplySpecializationWithMaterialization {
                 materialization_kind: MaterializationKind::Top,
                 ..
@@ -516,6 +524,14 @@ impl MaterializationKind {
             Self::Bottom => Self::Top,
         }
     }
+}
+
+/// The bottom and top materializations of a given gradual type.
+#[derive(Clone, Copy)]
+struct Materialization<'db> {
+    bottom: Type<'db>,
+    dynamic: DynamicType<'db>,
+    top: Type<'db>,
 }
 
 /// The descriptor protocol distinguishes two kinds of descriptors. Non-data descriptors
@@ -1487,6 +1503,7 @@ impl<'db> Type<'db> {
             | DynamicType::InvalidConcatenateUnknown
             | DynamicType::UnknownGeneric(_)
             | DynamicType::UnspecializedTypeVar
+            | DynamicType::UnknownLambdaParameter
             | DynamicType::AmbiguousOverload => false,
             DynamicType::Todo(_) => true,
         })
@@ -1678,6 +1695,52 @@ impl<'db> Type<'db> {
     #[must_use]
     fn bottom_materialization(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Type<'db> {
         (*self).cached_materialization(db, env.program(db), MaterializationKind::Bottom)
+    }
+
+    /// Returns the bottom and top materializations of this type with respect to the first instance
+    /// of a gradual type within it.
+    ///
+    /// Note that only a bare dynamic type or a gradual type within a top-level union or intersection
+    /// is considered.
+    fn materialize_once(self, db: &'db dyn Db) -> Option<Materialization<'db>> {
+        if !matches!(
+            self,
+            Type::Union(_) | Type::Intersection(_) | Type::Dynamic(_)
+        ) {
+            return None;
+        }
+
+        let (bottom, bottom_dynamic) =
+            self.materialize_once_with(db, MaterializationKind::Bottom)?;
+        let (top, top_dynamic) = self.materialize_once_with(db, MaterializationKind::Top)?;
+
+        if bottom != top && bottom_dynamic == top_dynamic {
+            Some(Materialization {
+                bottom,
+                dynamic: bottom_dynamic,
+                top,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn materialize_once_with(
+        self,
+        db: &'db dyn Db,
+        materialization_kind: MaterializationKind,
+    ) -> Option<(Type<'db>, DynamicType<'db>)> {
+        let materialized_dynamic = Cell::new(None);
+        let materialized = self.apply_type_mapping_impl(
+            db,
+            &TypeMapping::MaterializeOnce {
+                materialization_kind,
+                materialized_dynamic: &materialized_dynamic,
+            },
+            TypeContext::default(),
+            &ApplyTypeMappingVisitor::default(),
+        );
+        Some((materialized, materialized_dynamic.get()?))
     }
 
     #[salsa::tracked(
@@ -2244,6 +2307,7 @@ impl<'db> Type<'db> {
                 DynamicType::Unknown
                 | DynamicType::UnknownGeneric(_)
                 | DynamicType::UnspecializedTypeVar
+                | DynamicType::UnknownLambdaParameter
                 | DynamicType::Todo(_)
                 | DynamicType::InvalidConcatenateUnknown
                 | DynamicType::AmbiguousOverload => false,
@@ -6870,6 +6934,15 @@ impl<'db> Type<'db> {
         }
     }
 
+    /// Replaces every type variable with `replacement`.
+    pub(crate) fn specialize_all(self, db: &'db dyn Db, replacement: Type<'db>) -> Type<'db> {
+        self.apply_type_mapping(
+            db,
+            &TypeMapping::ApplySpecialization(ApplySpecialization::All(replacement)),
+            TypeContext::default(),
+        )
+    }
+
     /// Applies a specialization to this type, replacing any typevars with the types that they are
     /// specialized to.
     ///
@@ -6979,6 +7052,19 @@ impl<'db> Type<'db> {
         tcx: TypeContext<'db>,
         visitor: &ApplyTypeMappingVisitor<'_, 'db>,
     ) -> Type<'db> {
+        if let TypeMapping::MaterializeOnce {
+            materialized_dynamic,
+            ..
+        } = type_mapping
+            && (materialized_dynamic.get().is_some()
+                || !matches!(
+                    self,
+                    Type::Union(_) | Type::Intersection(_) | Type::Dynamic(_)
+                ))
+        {
+            return self;
+        }
+
         // If we are binding `typing.Self`, and this type is what we are binding `Self` to, return
         // early. This is not just an optimization, it also prevents us from infinitely expanding
         // the type, if it's something that can contain a `Self` reference.
@@ -7238,6 +7324,7 @@ impl<'db> Type<'db> {
                 TypeMapping::BindSelf { .. } |
                 TypeMapping::ReplaceSelf { .. } |
                 TypeMapping::Materialize(_) |
+                TypeMapping::MaterializeOnce { .. } |
                 TypeMapping::ReplaceParameterDefaults |
                 TypeMapping::EagerExpansion |
                 TypeMapping::RescopeReturnCallables(_) |
@@ -7249,7 +7336,7 @@ impl<'db> Type<'db> {
                 TypeMapping::Promote(PromotionMode::On, PromotionKind::Regular) => self.promote_impl(db, visitor.env),
             }
 
-            Type::Dynamic(_) => match type_mapping {
+            Type::Dynamic(dynamic) => match type_mapping {
                 TypeMapping::ApplySpecialization(_) |
                 TypeMapping::ApplySpecializationWithMaterialization { .. } |
                 TypeMapping::BindLegacyTypevars(_) |
@@ -7263,7 +7350,18 @@ impl<'db> Type<'db> {
                 TypeMapping::Materialize(materialization_kind) => match materialization_kind {
                     MaterializationKind::Top => Type::object(),
                     MaterializationKind::Bottom => Type::Never,
+                },
+                TypeMapping::MaterializeOnce {
+                    materialization_kind,
+                    materialized_dynamic,
+                } if !dynamic.is_provisional_marker() => {
+                    materialized_dynamic.set(Some(dynamic));
+                    match materialization_kind {
+                        MaterializationKind::Top => Type::object(),
+                        MaterializationKind::Bottom => Type::Never,
+                    }
                 }
+                TypeMapping::MaterializeOnce { .. } => self,
             }
             // `Divergent` is an internal cycle marker rather than a gradual type like `Any` or
             // `Unknown`. Preserve the marker across materialization, while recording whether this
@@ -7857,7 +7955,9 @@ impl<'db> Type<'db> {
 
             // These types have no definition
             Self::Dynamic(
-                DynamicType::InvalidConcatenateUnknown | DynamicType::UnspecializedTypeVar,
+                DynamicType::InvalidConcatenateUnknown
+                | DynamicType::UnspecializedTypeVar
+                | DynamicType::UnknownLambdaParameter,
             )
             | Self::Callable(_)
             | Self::TypeIs(_)
@@ -8399,7 +8499,7 @@ impl<'db> SelfBinding<'db> {
 /// since we sometimes have to apply type mappings lazily (e.g., to the signature of a function
 /// literal).
 #[derive(Clone, Debug, Eq, PartialEq, get_size2::GetSize)]
-pub enum TypeMapping<'a, 'db> {
+pub(crate) enum TypeMapping<'a, 'db> {
     /// Applies a specialization to the type
     ApplySpecialization(ApplySpecialization<'a, 'db>),
     /// Applies a specialization and materializes only substituted typevars.
@@ -8426,6 +8526,11 @@ pub enum TypeMapping<'a, 'db> {
     ReplaceSelf { new_upper_bound: Type<'db> },
     /// Create the top or bottom materialization of a type.
     Materialize(MaterializationKind),
+    /// Creates the top or bottom materialization of a type with respect to a single gradual occurrence.
+    MaterializeOnce {
+        materialization_kind: MaterializationKind,
+        materialized_dynamic: &'a Cell<Option<DynamicType<'db>>>,
+    },
     /// Replace default types in parameters of callables with `Unknown`. This is used to avoid infinite
     /// recursion when the type of the default value of a parameter depends on the callable itself.
     ReplaceParameterDefaults,
@@ -8480,6 +8585,7 @@ impl<'db> TypeMapping<'_, 'db> {
             TypeMapping::Promote(..)
             | TypeMapping::BindLegacyTypevars(_)
             | TypeMapping::Materialize(_)
+            | TypeMapping::MaterializeOnce { .. }
             | TypeMapping::ReplaceParameterDefaults
             | TypeMapping::EagerExpansion
             | TypeMapping::RescopeReturnCallables(_) => context,
@@ -8514,6 +8620,13 @@ impl<'db> TypeMapping<'_, 'db> {
             TypeMapping::Materialize(materialization_kind) => {
                 TypeMapping::Materialize(materialization_kind.flip())
             }
+            TypeMapping::MaterializeOnce {
+                materialization_kind,
+                materialized_dynamic,
+            } => TypeMapping::MaterializeOnce {
+                materialization_kind: materialization_kind.flip(),
+                materialized_dynamic,
+            },
             TypeMapping::ApplySpecializationWithMaterialization {
                 specialization,
                 materialization_kind,
@@ -8594,6 +8707,8 @@ pub enum DynamicType<'db> {
     /// calls. For now, we replace unspecialized type variables with this marker type, and ignore them
     /// during generic inference.
     UnspecializedTypeVar,
+    /// A provisional marker for a lambda parameter before access to its declared type.
+    UnknownLambdaParameter,
     /// A special variant that represents that `Unknown` was inferred due to an invalid use of
     /// `Concatenate` in a type expression.
     ///
@@ -8623,6 +8738,13 @@ impl DynamicType<'_> {
     fn is_todo(&self) -> bool {
         matches!(self, Self::Todo(_))
     }
+
+    pub(crate) const fn is_provisional_marker(self) -> bool {
+        matches!(
+            self,
+            Self::UnspecializedTypeVar | Self::UnknownLambdaParameter
+        )
+    }
 }
 
 impl std::fmt::Display for DynamicType<'_> {
@@ -8631,6 +8753,7 @@ impl std::fmt::Display for DynamicType<'_> {
             DynamicType::Any => f.write_str("Any"),
             DynamicType::Unknown
             | DynamicType::UnknownGeneric(_)
+            | DynamicType::UnknownLambdaParameter
             | DynamicType::InvalidConcatenateUnknown
             | DynamicType::AmbiguousOverload => f.write_str("Unknown"),
             DynamicType::UnspecializedTypeVar => f.write_str("UnspecializedTypeVar"),

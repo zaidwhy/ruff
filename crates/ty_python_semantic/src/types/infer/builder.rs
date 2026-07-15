@@ -6436,8 +6436,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             for binding in solution {
                 let inferred_ty = binding
                     .solution
-                    .filter_union(db, |ty| !ty.has_unspecialized_type_var(db, env));
-                if inferred_ty.has_unspecialized_type_var(db, env) {
+                    .filter_union(db, |ty| !ty.has_provisional_marker(db, env));
+                if inferred_ty.has_provisional_marker(db, env) {
                     continue;
                 }
 
@@ -7220,8 +7220,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             !ty.as_typevar()
                                 .is_some_and(|tv| tv.is_inferable(self.db(), inferable))
                         })
-                        .filter_union(db, |ty| !ty.has_unspecialized_type_var(db, env));
-                    if inferred_ty.has_unspecialized_type_var(db, env) {
+                        .filter_union(db, |ty| !ty.has_provisional_marker(db, env));
+                    if inferred_ty.has_provisional_marker(db, env) {
                         continue;
                     }
 
@@ -7271,8 +7271,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                 // type context from an outer generic call. If the type context is
                                 // a union, we try to keep any concrete elements.
                                 let inferred_ty = inferred_ty
-                                    .filter_union(db, |ty| !ty.has_unspecialized_type_var(db, env));
-                                if inferred_ty.has_unspecialized_type_var(db, env) {
+                                    .filter_union(db, |ty| !ty.has_provisional_marker(db, env));
+                                if inferred_ty.has_provisional_marker(db, env) {
                                     continue;
                                 }
 
@@ -7456,7 +7456,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     statement_use_types.collection_use_constraints(collection_def)
                 {
                     for constraint in constraints {
-                        if constraint.has_unspecialized_type_var(db, env) {
+                        if constraint.has_provisional_marker(db, env) {
                             continue;
                         }
 
@@ -8274,6 +8274,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .iter()
                 .map(|param| {
                     let parameter = Parameter::positional_only(Some(param.name().id.clone()))
+                        .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter))
                         .with_optional_default_type(param.default().map(|default_expr| {
                             self.infer_expression(default_expr, TypeContext::default())
                                 .replace_parameter_defaults(db, env)
@@ -8291,6 +8292,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .iter()
                 .map(|param| {
                     let parameter = Parameter::positional_or_keyword(param.name().id.clone())
+                        .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter))
                         .with_optional_default_type(param.default().map(|default_expr| {
                             self.infer_expression(default_expr, TypeContext::default())
                                 .replace_parameter_defaults(db, env)
@@ -8303,26 +8305,26 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     }
                 })
                 .collect::<Vec<_>>();
-            let variadic = parameters
-                .vararg
-                .as_ref()
-                .map(|param| Parameter::variadic(param.name().id.clone()));
+            let variadic = parameters.vararg.as_ref().map(|param| {
+                Parameter::variadic(param.name().id.clone())
+                    .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter))
+            });
             let keyword_only = parameters
                 .kwonlyargs
                 .iter()
                 .map(|param| {
-                    Parameter::keyword_only(param.name().id.clone()).with_optional_default_type(
-                        param.default().map(|default_expr| {
+                    Parameter::keyword_only(param.name().id.clone())
+                        .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter))
+                        .with_optional_default_type(param.default().map(|default_expr| {
                             self.infer_expression(default_expr, TypeContext::default())
                                 .replace_parameter_defaults(db, env)
-                        }),
-                    )
+                        }))
                 })
                 .collect::<Vec<_>>();
-            let keyword_variadic = parameters
-                .kwarg
-                .as_ref()
-                .map(|param| Parameter::keyword_variadic(param.name().id.clone()));
+            let keyword_variadic = parameters.kwarg.as_ref().map(|param| {
+                Parameter::keyword_variadic(param.name().id.clone())
+                    .with_inferred_type(Type::Dynamic(DynamicType::UnknownLambdaParameter))
+            });
 
             let parameters = positional_only
                 .into_iter()
