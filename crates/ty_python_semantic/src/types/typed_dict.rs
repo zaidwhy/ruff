@@ -24,7 +24,7 @@ use super::{
 use crate::types::TypeContext;
 use crate::types::TypeDefinition;
 use crate::types::class::FieldKind;
-use crate::types::constraints::{ConstraintSet, IteratorConstraintsExtension};
+use crate::types::constraints::{IteratorRelationConstraintsExtension, RelationConstraintSet};
 use crate::types::relation::{DisjointnessChecker, TypeRelation, TypeRelationChecker};
 use crate::{Db, ProgramEnvironment};
 use ty_python_core::definition::Definition;
@@ -658,7 +658,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         db: &'db dyn Db,
         source: TypedDictType<'db>,
         target: TypedDictType<'db>,
-    ) -> ConstraintSet<'db, 'c> {
+    ) -> RelationConstraintSet<'db, 'c> {
         if let TypedDictType::Synthesized(synthesized_target) = target
             && synthesized_target.is_patch(db)
         {
@@ -1081,12 +1081,14 @@ impl<'c, 'db> DisjointnessChecker<'_, 'c, 'db> {
         db: &'db dyn Db,
         left: TypedDictType<'db>,
         right: TypedDictType<'db>,
-    ) -> ConstraintSet<'db, 'c> {
+    ) -> RelationConstraintSet<'db, 'c> {
         let left_items = left.items(db);
         let right_items = right.items(db);
         let fields_in_common = btreemap_values_with_same_key(left_items, right_items);
-        let common_fields_disjoint =
-            fields_in_common.when_any(db, self.constraints, |(left_field, right_field)| {
+        let common_fields_disjoint = fields_in_common.when_any_relation(
+            db,
+            self.constraints,
+            |(left_field, right_field)| {
                 // Condition 1 above.
                 if left_field.is_required() || right_field.is_required() {
                     if (!left_field.is_required() && !left_field.is_read_only())
@@ -1125,7 +1127,8 @@ impl<'c, 'db> DisjointnessChecker<'_, 'c, 'db> {
                     // Condition 4 above.
                     self.check_type_pair(db, left_field.declared_ty, right_field.declared_ty)
                 }
-            });
+            },
+        );
 
         let required_fields_disjoint = common_fields_disjoint.or(db, self.constraints, || {
             left_items
@@ -1140,7 +1143,7 @@ impl<'c, 'db> DisjointnessChecker<'_, 'c, 'db> {
                         })
                         .map(|(_, field)| (field, left.openness(db))),
                 )
-                .when_any(db, self.constraints, |(required_field, other_openness)| {
+                .when_any_relation(db, self.constraints, |(required_field, other_openness)| {
                     let check_read_only_extra_items = |extra_items_ty| {
                         if required_field.is_read_only() {
                             self.check_type_pair(db, required_field.declared_ty, extra_items_ty)
@@ -1191,7 +1194,7 @@ impl<'c, 'db> DisjointnessChecker<'_, 'c, 'db> {
                         | TypedDictOpenness::Extra(_) => None,
                     }
                 })
-                .when_any(db, self.constraints, |(field, extra_items)| {
+                .when_any_relation(db, self.constraints, |(field, extra_items)| {
                     let Some(extra_items) = extra_items else {
                         return self.always();
                     };
