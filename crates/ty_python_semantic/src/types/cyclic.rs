@@ -36,7 +36,7 @@ use crate::types::generics::Specialization;
 use crate::types::visitor::{TypeCollector, TypeVisitor, walk_type_with_recursion_guard};
 use crate::types::{
     BoundTypeVarInstance, ClassType, GenericAlias, NominalInstanceType, ProtocolInstanceType,
-    SubclassOfType, Type, TypeAliasType, TypedDictType,
+    SubclassOfInner, SubclassOfType, Type, TypeAliasType, TypedDictType,
 };
 use crate::{Db, ProgramEnvironment};
 
@@ -56,8 +56,21 @@ impl<'db> Type<'db> {
     /// Projects a class-object wrapper onto the instance type whose definition owns its recursion.
     fn type_identity_owner(self, db: &'db dyn Db) -> Self {
         match self {
-            Type::GenericAlias(alias) => Type::instance(db, ClassType::Generic(alias)),
-            Type::SubclassOf(subclass_of) => subclass_of.to_instance(db),
+            Type::GenericAlias(alias) => {
+                let class = ClassType::Generic(alias);
+                let env = ProgramEnvironment::from_file(class.class_literal(db).program_file(db));
+                Type::instance(db, &env, class)
+            }
+            Type::SubclassOf(subclass_of) => match subclass_of.subclass_of() {
+                SubclassOfInner::Class(class) => {
+                    let env =
+                        ProgramEnvironment::from_file(class.class_literal(db).program_file(db));
+                    Type::instance(db, &env, class)
+                }
+                SubclassOfInner::Dynamic(dynamic) => Type::Dynamic(dynamic),
+                SubclassOfInner::Protocol(protocol) => Type::ProtocolInstance(protocol),
+                SubclassOfInner::TypeVar(typevar) => Type::TypeVar(typevar),
+            },
             _ => self,
         }
     }
@@ -98,13 +111,6 @@ impl<'db> Type<'db> {
     /// This is a hot-path filter and must not walk either type. A `true` result is only a candidate
     /// match and must be confirmed with [`Type::to_type_identity`].
     pub(crate) fn may_share_type_identity(self, db: &'db dyn Db, other: Self) -> bool {
-        let self_owner = self.type_identity_owner(db);
-        let other_owner = other.type_identity_owner(db);
-
-        if self_owner != self || other_owner != other {
-            return self_owner.may_share_type_identity(db, other_owner);
-        }
-
         if self == other {
             return true;
         }
@@ -121,8 +127,39 @@ impl<'db> Type<'db> {
             }
             (Type::TypeAlias(a), Type::TypeAlias(b)) => a.definition(db) == b.definition(db),
             (Type::TypedDict(a), Type::TypedDict(b)) => a.definition(db) == b.definition(db),
+            (Type::GenericAlias(_) | Type::SubclassOf(_), _)
+            | (_, Type::GenericAlias(_) | Type::SubclassOf(_)) => true,
             _ => false,
         }
+    }
+
+    /// Returns `false` if cheap inspection proves that `self` cannot grow from `active` in a type
+    /// relation cycle.
+    pub(crate) fn may_share_relation_type_identity(self, db: &'db dyn Db, active: Self) -> bool {
+        if self == active {
+            return true;
+        }
+
+        let specializations = match (self, active) {
+            (Type::NominalInstance(current), Type::NominalInstance(active)) => {
+                (current.specialization(db), active.specialization(db))
+            }
+            (Type::ProtocolInstance(current), Type::ProtocolInstance(active)) => {
+                (current.specialization(db), active.specialization(db))
+            }
+            (Type::TypedDict(current), Type::TypedDict(active)) => {
+                (current.specialization(db), active.specialization(db))
+            }
+            (Type::GenericAlias(_) | Type::SubclassOf(_), _)
+            | (_, Type::GenericAlias(_) | Type::SubclassOf(_)) => return true,
+            _ => return self.may_share_type_identity(db, active),
+        };
+
+        let (Some(current), Some(active)) = specializations else {
+            return false;
+        };
+        // Inspect type arguments only after the identities match.
+        current.generic_context(db) == active.generic_context(db)
     }
 
     /// Returns whether equal type identities form a recursive cycle.
@@ -195,6 +232,7 @@ impl<'db> Type<'db> {
 }
 
 struct NestedTypeVisitor<'db> {
+    env: ProgramEnvironment<'db>,
     target: Type<'db>,
     active_aliases: ActiveRecursionDetector<Definition<'db>>,
     visited: TypeCollector<'db>,
@@ -207,7 +245,9 @@ impl<'db> NestedTypeVisitor<'db> {
         specialization: Specialization<'db>,
         target: Type<'db>,
     ) -> bool {
+        let env = ProgramEnvironment::from_program(specialization.generic_context(db).program(db));
         let visitor = Self {
+            env,
             target,
             active_aliases: ActiveRecursionDetector::default(),
             visited: TypeCollector::default(),
@@ -224,6 +264,10 @@ impl<'db> NestedTypeVisitor<'db> {
 }
 
 impl<'db> TypeVisitor<'db> for NestedTypeVisitor<'db> {
+    fn program_environment(&self) -> &ProgramEnvironment<'db> {
+        &self.env
+    }
+
     fn should_visit_lazy_type_attributes(&self) -> bool {
         false
     }
@@ -249,11 +293,11 @@ impl<'db> TypeVisitor<'db> for NestedTypeVisitor<'db> {
     }
 
     fn visit_generic_alias_type(&self, db: &'db dyn Db, alias: GenericAlias<'db>) {
-        self.visit_type(db, Type::instance(db, ClassType::Generic(alias)));
+        self.visit_type(db, Type::instance(db, &self.env, ClassType::Generic(alias)));
     }
 
     fn visit_subclass_of_type(&self, db: &'db dyn Db, subclass_of: SubclassOfType<'db>) {
-        self.visit_type(db, subclass_of.to_instance(db));
+        self.visit_type(db, subclass_of.to_instance(db, &self.env));
     }
 
     fn visit_type_alias_type(&self, db: &'db dyn Db, alias: TypeAliasType<'db>) {
@@ -284,14 +328,21 @@ impl<'db> TypeVisitor<'db> for NestedTypeVisitor<'db> {
 }
 
 struct EagerTypeContainmentVisitor<'db> {
+    env: ProgramEnvironment<'db>,
     target: Type<'db>,
     visited: TypeCollector<'db>,
     found: Cell<bool>,
 }
 
 impl<'db> EagerTypeContainmentVisitor<'db> {
-    fn contains(db: &'db dyn Db, ty: Type<'db>, target: Type<'db>) -> bool {
+    fn contains(
+        db: &'db dyn Db,
+        env: ProgramEnvironment<'db>,
+        ty: Type<'db>,
+        target: Type<'db>,
+    ) -> bool {
         let visitor = Self {
+            env,
             target,
             visited: TypeCollector::default(),
             found: Cell::new(false),
@@ -302,6 +353,10 @@ impl<'db> EagerTypeContainmentVisitor<'db> {
 }
 
 impl<'db> TypeVisitor<'db> for EagerTypeContainmentVisitor<'db> {
+    fn program_environment(&self) -> &ProgramEnvironment<'db> {
+        &self.env
+    }
+
     fn should_visit_lazy_type_attributes(&self) -> bool {
         false
     }
@@ -346,26 +401,33 @@ impl<'db> Specialization<'db> {
             return false;
         }
 
+        let env = ProgramEnvironment::from_program(self.generic_context(db).program(db));
+
         self.types(db)
             .iter()
             .zip(active.types(db))
             .any(|(current_ty, active_ty)| {
                 current_ty != active_ty
-                    && EagerTypeContainmentVisitor::contains(db, *current_ty, *active_ty)
+                    && EagerTypeContainmentVisitor::contains(
+                        db,
+                        env.clone(),
+                        *current_ty,
+                        *active_ty,
+                    )
             })
     }
 }
 
 impl<'db> NominalInstanceType<'db> {
     fn definition(self, db: &'db dyn Db) -> Option<Definition<'db>> {
-        self.class(db).definition(db)
+        self.stored_class(db)?.definition(db)
     }
 
     fn specialization(self, db: &'db dyn Db) -> Option<Specialization<'db>> {
         if self.own_tuple_spec(db).is_some() {
             return None;
         }
-        self.class(db)
+        self.stored_class(db)?
             .into_generic_alias()
             .map(|alias| alias.specialization(db))
     }
@@ -454,7 +516,8 @@ impl<'db> HasIdentity<'db> for (Type<'db>, Type<'db>) {
     type Id = (TypeIdentity<'db>, TypeIdentity<'db>);
 
     fn may_share_identity(&self, db: &'db dyn Db, other: &Self) -> bool {
-        self.0.may_share_type_identity(db, other.0) && self.1.may_share_type_identity(db, other.1)
+        self.0.may_share_relation_type_identity(db, other.0)
+            && self.1.may_share_relation_type_identity(db, other.1)
     }
 
     fn to_identity(&self, db: &'db dyn Db) -> Self::Id {
@@ -474,9 +537,9 @@ where
     type Id = (TypeIdentity<'db>, Context, TypeIdentity<'db>);
 
     fn may_share_identity(&self, db: &'db dyn Db, other: &Self) -> bool {
-        self.0.may_share_type_identity(db, other.0)
+        self.0.may_share_relation_type_identity(db, other.0)
             && self.1 == other.1
-            && self.2.may_share_type_identity(db, other.2)
+            && self.2.may_share_relation_type_identity(db, other.2)
     }
 
     fn to_identity(&self, db: &'db dyn Db) -> Self::Id {
