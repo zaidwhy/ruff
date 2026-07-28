@@ -456,7 +456,7 @@ impl ClassInfoConstraintFunction {
         env: &ProgramEnvironment<'db>,
         classinfo: Type<'db>,
         is_positive: bool,
-        strict_generic_narrowing: bool,
+        use_narrowing_bounds: bool,
     ) -> Option<Type<'db>> {
         let constraint_from_class_literal = |class: ClassLiteral<'db>| match self {
             ClassInfoConstraintFunction::IsInstance => {
@@ -549,7 +549,7 @@ impl ClassInfoConstraintFunction {
                             db,
                             constraints.as_type(db),
                             is_positive,
-                            strict_generic_narrowing,
+                            use_narrowing_bounds,
                         ),
                 }
             }
@@ -600,7 +600,7 @@ impl ClassInfoConstraintFunction {
                     env,
                     alias.aliased_class().to_class_literal(db, env),
                     is_positive,
-                    strict_generic_narrowing,
+                    use_narrowing_bounds,
                 ),
                 SpecialFormType::Tuple => self.generate_constraint(
                     db,
@@ -613,13 +613,13 @@ impl ClassInfoConstraintFunction {
                     env,
                     KnownClass::Type.to_class_literal(db, env),
                     is_positive,
-                    strict_generic_narrowing,
+                    use_narrowing_bounds,
                 ),
                 SpecialFormType::Type => self.generate_constraint(
                     db,
                     KnownClass::Type.to_class_literal(db),
                     is_positive,
-                    strict_generic_narrowing,
+                    use_narrowing_bounds,
                 ),
 
                 // We don't have a good meta-type for `Callable`s right now,
@@ -737,9 +737,6 @@ pub(crate) struct NarrowingConstraint<'db> {
     /// `TypeGuard` clobbers the previously-known type; within each replacement disjunct, however,
     /// we may eagerly intersect conjunctions with a later intersection narrowing.
     replacement_disjuncts: SmallVec<[Conjunctions<'db>; 1]>,
-
-    /// Whether this constraint contains tagged narrowing bounds that must be erased.
-    has_narrowing_bounds: bool,
 }
 
 impl<'db> NarrowingConstraint<'db> {
@@ -749,15 +746,6 @@ impl<'db> NarrowingConstraint<'db> {
         Self {
             intersection_disjuncts: smallvec_inline![Conjunctions::singleton(constraint)],
             replacement_disjuncts: smallvec![],
-            has_narrowing_bounds: false,
-        }
-    }
-
-    fn class_info(constraint: Type<'db>, has_narrowing_bounds: bool) -> Self {
-        Self {
-            intersection_disjuncts: smallvec_inline![Conjunctions::singleton(constraint)],
-            replacement_disjuncts: smallvec![],
-            has_narrowing_bounds,
         }
     }
 
@@ -767,7 +755,6 @@ impl<'db> NarrowingConstraint<'db> {
         Self {
             intersection_disjuncts: smallvec![],
             replacement_disjuncts: smallvec_inline![Conjunctions::singleton(constraint)],
-            has_narrowing_bounds: false,
         }
     }
 
@@ -789,8 +776,6 @@ impl<'db> NarrowingConstraint<'db> {
         if other.intersection_disjuncts.is_empty() {
             return other;
         }
-
-        let has_narrowing_bounds = self.has_narrowing_bounds || other.has_narrowing_bounds;
 
         let mut new_intersection_disjuncts = smallvec![];
         for intersection_disjunct in &self.intersection_disjuncts {
@@ -823,13 +808,11 @@ impl<'db> NarrowingConstraint<'db> {
         NarrowingConstraint {
             intersection_disjuncts: new_intersection_disjuncts,
             replacement_disjuncts: new_replacement_disjuncts,
-            has_narrowing_bounds,
         }
     }
 
     /// Merge two constraints with OR semantics (union/disjunction).
     fn merge_constraint_or(&mut self, other: Self) {
-        self.has_narrowing_bounds |= other.has_narrowing_bounds;
         self.intersection_disjuncts
             .extend(other.intersection_disjuncts);
         self.replacement_disjuncts
@@ -852,12 +835,7 @@ impl<'db> NarrowingConstraint<'db> {
         {
             union.add_in_place(conjunctions.evaluate_constraint_type(db, env));
         }
-        let ty = union.build();
-        if has_narrowing_bounds {
-            ty.erase_narrowing_bounds(db)
-        } else {
-            ty
-        }
+        union.build()
     }
 }
 
@@ -1022,7 +1000,7 @@ fn positive_class_pattern_type<'db>(
                 env,
                 class_expression_ty,
                 true,
-                true,
+                false,
             )
         }
         _ => None,
@@ -3919,11 +3897,11 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
 
                 let class_info_ty = inference.expression_type(second_arg);
 
-                let strict_generic_narrowing = self
-                    .db
-                    .analysis_settings(self.scope().file(self.db))
-                    .strict_generic_narrowing;
-
+                let use_narrowing_bounds = is_positive
+                    && !self
+                        .db
+                        .analysis_settings(self.scope().file(self.db))
+                        .strict_generic_narrowing;
                 function
                     .generate_constraint(db, &self.env, class_info_ty, is_positive)
                     .map(|constraint| {
