@@ -2928,11 +2928,12 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
 
         fn normalize_dict_constructor_intersection<'db>(
             db: &'db dyn Db,
+            env: &ProgramEnvironment<'db>,
             intersection: IntersectionType<'db>,
             dict_specializations: [Type<'db>; 2],
         ) -> Type<'db> {
             let [dict, dict_top] = dict_specializations;
-            intersection.map_positive(db, |element| {
+            intersection.map_positive(db, env, |element| {
                 let resolved = element.resolve_type_alias(db);
                 if resolved == dict { dict_top } else { *element }
             })
@@ -2985,10 +2986,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                         && intersection.iter_positive(db).all(|element| {
                             let element = element.resolve_type_alias(db);
                             element.is_typed_dict()
-                                || element
-                                    == KnownClass::Dict
-                                        .to_instance_unknown(db, env)
-                                        .top_materialization(db, env)
+                                || dict_narrowing.specializations.contains(&element)
                         }) =>
                 {
                     // `isinstance(value, dict)` narrows a `TypedDict` to an intersection with
@@ -2998,6 +2996,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                     let ty = if dict_narrowing.is_constructor_protocol {
                         normalize_dict_constructor_intersection(
                             db,
+                            env,
                             intersection,
                             dict_narrowing.specializations,
                         )
@@ -3015,10 +3014,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                         && intersection.iter_positive(db).all(|element| {
                             let element = element.resolve_type_alias(db);
                             is_string_keyed_mapping(db, env, element)
-                                || element
-                                    == KnownClass::Dict
-                                        .to_instance_unknown(db, env)
-                                        .top_materialization(db, env)
+                                || dict_narrowing.specializations.contains(&element)
                         }) =>
                 {
                     // `isinstance(value, dict)` can also narrow a mapping to an intersection with
@@ -3028,6 +3024,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                     let ty = if dict_narrowing.is_constructor_protocol {
                         normalize_dict_constructor_intersection(
                             db,
+                            env,
                             intersection,
                             dict_narrowing.specializations,
                         )
@@ -3047,20 +3044,20 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             result
         }
         let db = self.db;
+        let env = self.env;
 
-        let dict = KnownClass::Dict.to_instance_unknown(self.db);
+        let dict = KnownClass::Dict.to_instance_unknown(db, env);
         let dict_narrowing = DictNarrowingContext {
-            specializations: [dict, dict.top_materialization(self.db)],
+            specializations: [dict, dict.top_materialization(db, env)],
             is_constructor_protocol: matches!(formal, Type::ProtocolInstance(protocol)
-            if protocol.class_origin(self.db).is_some_and(|class| {
-                class.is_known(self.db, KnownClass::SupportsKeysAndGetItem)
+            if protocol.class_origin(db).is_some_and(|class| {
+                class.is_known(db, KnownClass::SupportsKeysAndGetItem)
             })),
         };
         let mut resolving = FxHashSet::default();
         let mut completed = FxHashMap::default();
         let mut typed_dicts = FxHashSet::default();
         let mut other_types = FxOrderSet::default();
-        let env = self.env;
 
         if !actual.elements(db).iter().all(|element| {
             collect_typed_dicts(
@@ -3081,12 +3078,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         }
         // Other protocols can observe key-specific or gradual evidence that the shared mapping
         // fallback erases; restrict mixed unions to the protocol used by dictionary constructors.
-        if !other_types.is_empty()
-            && !matches!(formal, Type::ProtocolInstance(protocol)
-            if protocol.class_origin(db).is_some_and(|class| {
-                class.is_known(db, KnownClass::SupportsKeysAndGetItem)
-            }))
-        {
+        if !other_types.is_empty() && !dict_narrowing.is_constructor_protocol {
             return None;
         }
 
