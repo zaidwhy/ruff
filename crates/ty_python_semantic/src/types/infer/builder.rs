@@ -10317,6 +10317,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         if attribute.ctx == ExprContext::Load
             && let Some(failure) = fallback
                 .descriptor_get_error
+                .filter(|context| assigned_type.is_none() || context.kind(db).is_data())
                 .and_then(|context| context.into_error(db, env))
         {
             report_bad_dunder_get_call(&self.context, &failure, value_type, attribute);
