@@ -461,6 +461,23 @@ pub(crate) enum KnownUnion {
 }
 
 impl KnownUnion {
+    pub(crate) const fn annotation_class(self) -> KnownClass {
+        match self {
+            Self::Float => KnownClass::Float,
+            Self::Complex => KnownClass::Complex,
+        }
+    }
+
+    pub(crate) const fn contains(self, class: KnownClass) -> bool {
+        match self {
+            Self::Float => matches!(class, KnownClass::Int | KnownClass::Float),
+            Self::Complex => matches!(
+                class,
+                KnownClass::Int | KnownClass::Float | KnownClass::Complex
+            ),
+        }
+    }
+
     pub(crate) fn to_type(self, db: &dyn Db) -> Type<'_> {
         match self {
             KnownUnion::Float => UnionType::from_two_elements(

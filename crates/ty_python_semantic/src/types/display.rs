@@ -32,9 +32,10 @@ use crate::types::typevar::BoundTypeVarIdentity;
 use crate::types::visitor::TypeVisitor;
 use crate::types::{
     CallableType, IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType,
-    LiteralValueType, LiteralValueTypeKind, MaterializationKind, PropertyInstanceType, Protocol,
-    SpecialFormType, StringLiteralType, SubclassOfInner, SubclassOfType, Type, TypeAliasType,
-    TypeGuardLike, TypedDictModule, TypedDictType, UnionType, WrapperDescriptorKind, visitor,
+    KnownUnion, LiteralValueType, LiteralValueTypeKind, MaterializationKind, PropertyInstanceType,
+    Protocol, SpecialFormType, StringLiteralType, SubclassOfInner, SubclassOfType, Type,
+    TypeAliasType, TypeGuardLike, TypedDictModule, TypedDictType, UnionType, WrapperDescriptorKind,
+    visitor,
 };
 use ty_python_core::definition::Definition;
 use ty_python_core::scope::{FileScopeId, ScopeKind};
@@ -102,6 +103,13 @@ impl SignatureNameDisplay {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+enum NumericTowerDisplay {
+    #[default]
+    Canonical,
+    Expanded,
+}
+
 /// Settings for displaying types and signatures
 #[derive(Debug, Clone, Default)]
 pub struct DisplaySettings<'db> {
@@ -117,6 +125,8 @@ pub struct DisplaySettings<'db> {
     qualified_type_aliases: Rc<FxHashMap<&'db str, QualificationLevel>>,
     /// Whether long unions and literals are displayed in full
     preserve_full_unions: bool,
+    /// How numeric-tower unions should be displayed.
+    numeric_tower_display: NumericTowerDisplay,
     /// Scopes that are currently active in the display context (e.g. function scopes
     /// whose type parameters are currently being displayed).
     /// Used to suppress redundant `@{scope}` suffixes for type variables.
@@ -151,6 +161,14 @@ impl<'db> DisplaySettings<'db> {
         Self {
             preserve_full_unions: true,
             ..self
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn expand_numeric_tower_unions(&self) -> Self {
+        Self {
+            numeric_tower_display: NumericTowerDisplay::Expanded,
+            ..self.clone()
         }
     }
 
@@ -960,6 +978,14 @@ impl<'db> FmtDetailed<'db> for DisplayRepresentation<'db> {
                 match (class, class.known(self.db)) {
                     (_, Some(KnownClass::NoneType)) => f.with_type(self.ty).write_str("None"),
                     (_, Some(KnownClass::NoDefaultType)) => f.with_type(self.ty).write_str("NoDefault"),
+                    (_, Some(KnownClass::Float | KnownClass::Complex)) => {
+                        f.set_invalid_type_annotation();
+                        class
+                            .class_literal(self.db)
+                            .display_with(self.db, self.settings.clone())
+                            .fmt_detailed(f)?;
+                        f.write_char('*')
+                    }
                     (ClassType::Generic(alias), Some(KnownClass::Tuple)) => alias
                         .specialization(self.db)
                         .tuple(self.db)
@@ -2665,6 +2691,46 @@ const UNION_POLICY: TruncationPolicy = TruncationPolicy {
     max_when_elided: 3,
 };
 
+fn numeric_tower_group(known_classes: impl IntoIterator<Item = KnownClass>) -> Option<KnownUnion> {
+    let mut has_int = false;
+    let mut has_float = false;
+    let mut has_complex = false;
+
+    for known_class in known_classes {
+        match known_class {
+            KnownClass::Int => has_int = true,
+            KnownClass::Float => has_float = true,
+            KnownClass::Complex => has_complex = true,
+            _ => {}
+        }
+    }
+
+    match (has_int, has_float, has_complex) {
+        (true, true, true) => Some(KnownUnion::Complex),
+        (true, true, false) => Some(KnownUnion::Float),
+        _ => None,
+    }
+}
+
+fn subclass_of_known_class(db: &dyn Db, subclass_of: SubclassOfType<'_>) -> Option<KnownClass> {
+    match subclass_of.subclass_of() {
+        SubclassOfInner::Class(class) => class.known(db),
+        _ => None,
+    }
+}
+
+enum UnionDisplayEntry<'db> {
+    NumericTower(KnownUnion),
+    Literals(Vec<Type<'db>>),
+    Subclasses(Vec<SubclassOfType<'db>>),
+    Type(Type<'db>),
+}
+
+enum SubclassDisplayEntry<'db> {
+    NumericTower(KnownUnion),
+    Type(SubclassOfType<'db>),
+}
+
 impl<'db> FmtDetailed<'db> for DisplayUnionType<'_, 'db> {
     fn fmt_detailed(&self, f: &mut TypeWriter<'_, '_, 'db>) -> fmt::Result {
         /// Return the literal types that can be folded into a displayed `Literal[...]` group.
@@ -2729,22 +2795,23 @@ impl<'db> FmtDetailed<'db> for DisplayUnionType<'_, 'db> {
         }
 
         let elements = self.ty.elements(self.db);
+        let numeric_tower_group = matches!(
+            self.settings.numeric_tower_display,
+            NumericTowerDisplay::Canonical
+        )
+        .then(|| {
+            numeric_tower_group(elements.iter().filter_map(|element| {
+                element
+                    .as_nominal_instance()
+                    .and_then(|instance| instance.known_class(self.db))
+            }))
+        })
+        .flatten();
         let mut condensed_types = vec![];
-        let mut condensed_element_count = 0usize;
         let mut subclass_of_types = vec![];
-        let element_labels: Vec<_> = elements
-            .iter()
-            .copied()
-            .map(|element| {
-                (condensable_literals(self.db, element).is_none() && !element.is_subclass_of())
-                    .then(|| singleline_union_element_label(self.db, element, &self.settings))
-            })
-            .collect();
-        let duplicate_ambiguous_labels = duplicate_ambiguous_labels(&element_labels);
 
         for element in elements.iter().copied() {
             if let Some(literals) = condensable_literals(self.db, element) {
-                condensed_element_count += 1;
                 for literal in literals {
                     if !condensed_types.contains(&literal) {
                         condensed_types.push(literal);
@@ -2755,9 +2822,47 @@ impl<'db> FmtDetailed<'db> for DisplayUnionType<'_, 'db> {
             }
         }
 
-        let total_entries = elements.len() - condensed_element_count - subclass_of_types.len()
-            + usize::from(!condensed_types.is_empty())
-            + usize::from(!subclass_of_types.is_empty());
+        let mut pending_numeric_tower_group = numeric_tower_group;
+        let mut condensed_types = (!condensed_types.is_empty()).then_some(condensed_types);
+        let mut subclass_of_types = (!subclass_of_types.is_empty()).then_some(subclass_of_types);
+        let mut display_entries = Vec::with_capacity(elements.len());
+
+        for element in elements.iter().copied() {
+            if numeric_tower_group.is_some_and(|group| {
+                element
+                    .as_nominal_instance()
+                    .and_then(|instance| instance.known_class(self.db))
+                    .is_some_and(|known_class| group.contains(known_class))
+            }) {
+                if let Some(group) = pending_numeric_tower_group.take() {
+                    display_entries.push(UnionDisplayEntry::NumericTower(group));
+                }
+            } else if condensable_literals(self.db, element).is_some() {
+                if let Some(literals) = condensed_types.take() {
+                    display_entries.push(UnionDisplayEntry::Literals(literals));
+                }
+            } else if element.is_subclass_of() {
+                if let Some(subclasses) = subclass_of_types.take() {
+                    display_entries.push(UnionDisplayEntry::Subclasses(subclasses));
+                }
+            } else {
+                display_entries.push(UnionDisplayEntry::Type(element));
+            }
+        }
+
+        let element_labels: Vec<_> = display_entries
+            .iter()
+            .map(|entry| match entry {
+                UnionDisplayEntry::Type(ty) => {
+                    Some(singleline_union_element_label(self.db, *ty, &self.settings))
+                }
+                UnionDisplayEntry::NumericTower(_)
+                | UnionDisplayEntry::Literals(_)
+                | UnionDisplayEntry::Subclasses(_) => None,
+            })
+            .collect();
+        let duplicate_ambiguous_labels = duplicate_ambiguous_labels(&element_labels);
+        let total_entries = display_entries.len();
 
         assert_ne!(total_entries, 0);
 
@@ -2767,53 +2872,53 @@ impl<'db> FmtDetailed<'db> for DisplayUnionType<'_, 'db> {
         let display_limit =
             UNION_POLICY.display_limit(total_entries, self.settings.preserve_full_unions);
 
-        let mut condensed_types = Some(condensed_types);
-        let mut subclass_of_types = Some(subclass_of_types);
-        let mut displayed_entries = 0usize;
-
-        for (element, label) in elements.iter().zip(&element_labels) {
-            if displayed_entries >= display_limit {
-                break;
-            }
-
-            if condensable_literals(self.db, *element).is_some() {
-                if let Some(condensed_types) = condensed_types.take() {
-                    displayed_entries += 1;
+        for (entry, label) in display_entries
+            .into_iter()
+            .zip(&element_labels)
+            .take(display_limit)
+        {
+            match entry {
+                UnionDisplayEntry::NumericTower(union) => {
+                    join.entry(&DisplayKnownUnion {
+                        union,
+                        db: self.db,
+                        settings: self.settings.singleline(),
+                    });
+                }
+                UnionDisplayEntry::Literals(literals) => {
                     join.entry(&DisplayLiteralGroup {
-                        literals: condensed_types,
+                        literals,
                         db: self.db,
                         settings: self.settings.singleline(),
                     });
                 }
-            } else if element.is_subclass_of() {
-                if let Some(subclass_of_types) = subclass_of_types.take() {
-                    displayed_entries += 1;
+                UnionDisplayEntry::Subclasses(types) => {
                     join.entry(&DisplaySubclassOfGroup {
-                        types: subclass_of_types,
+                        types,
                         db: self.db,
                         settings: self.settings.singleline(),
                     });
                 }
-            } else {
-                displayed_entries += 1;
-                let settings = if label
-                    .as_deref()
-                    .is_some_and(|label| duplicate_ambiguous_labels.contains(label))
-                {
-                    self.settings.singleline().force_signature_name()
-                } else {
-                    self.settings.singleline()
-                };
-                join.entry(&DisplayMaybeParenthesizedType {
-                    ty: *element,
-                    db: self.db,
-                    settings,
-                });
+                UnionDisplayEntry::Type(ty) => {
+                    let settings = if label
+                        .as_deref()
+                        .is_some_and(|label| duplicate_ambiguous_labels.contains(label))
+                    {
+                        self.settings.singleline().force_signature_name()
+                    } else {
+                        self.settings.singleline()
+                    };
+                    join.entry(&DisplayMaybeParenthesizedType {
+                        ty,
+                        db: self.db,
+                        settings,
+                    });
+                }
             }
         }
 
         if !self.settings.preserve_full_unions {
-            let omitted_entries = total_entries.saturating_sub(displayed_entries);
+            let omitted_entries = total_entries.saturating_sub(display_limit);
             if omitted_entries > 0 {
                 join.entry(&DisplayOmitted {
                     count: omitted_entries,
@@ -2823,6 +2928,26 @@ impl<'db> FmtDetailed<'db> for DisplayUnionType<'_, 'db> {
             }
         }
         join.finish()
+    }
+}
+
+struct DisplayKnownUnion<'db> {
+    union: KnownUnion,
+    db: &'db dyn Db,
+    settings: DisplaySettings<'db>,
+}
+
+impl<'db> FmtDetailed<'db> for DisplayKnownUnion<'db> {
+    fn fmt_detailed(&self, f: &mut TypeWriter<'_, '_, 'db>) -> fmt::Result {
+        let class = self.union.annotation_class();
+        if let Some(class_literal) = class.try_to_class_literal(self.db) {
+            ClassLiteral::Static(class_literal)
+                .display_with(self.db, self.settings.clone())
+                .fmt_detailed(f)
+        } else {
+            f.with_type(class.to_instance(self.db))
+                .write_str(class.name(self.db))
+        }
     }
 }
 
@@ -2847,11 +2972,52 @@ struct DisplaySubclassOfGroup<'db> {
 impl<'db> FmtDetailed<'db> for DisplaySubclassOfGroup<'db> {
     fn fmt_detailed(&self, f: &mut TypeWriter<'_, '_, 'db>) -> fmt::Result {
         f.write_str("type[")?;
-        let total_entries = self.types.len();
+        let numeric_tower_group = matches!(
+            self.settings.numeric_tower_display,
+            NumericTowerDisplay::Canonical
+        )
+        .then(|| {
+            numeric_tower_group(
+                self.types
+                    .iter()
+                    .filter_map(|subclass_of| subclass_of_known_class(self.db, *subclass_of)),
+            )
+        })
+        .flatten();
+        let mut pending_numeric_tower_group = numeric_tower_group;
+        let mut display_entries = Vec::with_capacity(self.types.len());
+
+        for subclass_of in &self.types {
+            if numeric_tower_group.is_some_and(|group| {
+                subclass_of_known_class(self.db, *subclass_of)
+                    .is_some_and(|known_class| group.contains(known_class))
+            }) {
+                if let Some(group) = pending_numeric_tower_group.take() {
+                    display_entries.push(SubclassDisplayEntry::NumericTower(group));
+                }
+            } else {
+                display_entries.push(SubclassDisplayEntry::Type(*subclass_of));
+            }
+        }
+
+        let total_entries = display_entries.len();
         let display_limit =
             UNION_POLICY.display_limit(total_entries, self.settings.preserve_full_unions);
         let mut join = f.join(" | ");
-        for subclass_of in self.types.iter().take(display_limit) {
+
+        for entry in display_entries.into_iter().take(display_limit) {
+            let subclass_of = match entry {
+                SubclassDisplayEntry::NumericTower(union) => {
+                    join.entry(&DisplayKnownUnion {
+                        union,
+                        db: self.db,
+                        settings: self.settings.singleline(),
+                    });
+                    continue;
+                }
+                SubclassDisplayEntry::Type(subclass_of) => subclass_of,
+            };
+
             match subclass_of.subclass_of() {
                 SubclassOfInner::Class(ClassType::NonGeneric(class)) => {
                     join.entry(&class.display_with(self.db, self.settings.singleline()));
@@ -3070,10 +3236,17 @@ impl<'db> FmtDetailed<'db> for DisplayMaybeParenthesizedType<'db> {
         };
         match self.ty {
             ty if should_parenthesize_callable_type(ty, self.db) => write_parentheses(f),
-            Type::KnownBoundMethod(_)
-            | Type::FunctionLiteral(_)
-            | Type::BoundMethod(_)
-            | Type::Union(_) => write_parentheses(f),
+            Type::KnownBoundMethod(_) | Type::FunctionLiteral(_) | Type::BoundMethod(_) => {
+                write_parentheses(f)
+            }
+            Type::Union(union)
+                if matches!(
+                    self.settings.numeric_tower_display,
+                    NumericTowerDisplay::Expanded
+                ) || union.known(self.db).is_none() =>
+            {
+                write_parentheses(f)
+            }
             Type::Intersection(intersection) if !intersection.has_one_element(self.db) => {
                 write_parentheses(f)
             }
@@ -3411,7 +3584,10 @@ mod tests {
 
     use crate::Db;
     use crate::db::tests::setup_db;
-    use crate::types::{KnownClass, Parameter, Parameters, Signature, Type};
+    use crate::types::{
+        DisplaySettings, KnownClass, KnownUnion, Parameter, Parameters, Signature, Type,
+        TypeDetail, UnionType,
+    };
 
     #[test]
     fn string_literal_display() {
@@ -3429,6 +3605,65 @@ mod tests {
             Type::string_literal(&db, r#"""#).display(&db).to_string(),
             r#"Literal["\""]"#
         );
+    }
+
+    #[test]
+    fn numeric_tower_display() {
+        let db = setup_db();
+
+        let exact_float = KnownClass::Float.to_instance(&db);
+        let exact_complex = KnownClass::Complex.to_instance(&db);
+        let float_annotation = KnownUnion::Float.to_type(&db);
+        let complex_annotation = KnownUnion::Complex.to_type(&db);
+
+        assert_snapshot!(exact_float.display(&db), @"float*");
+        assert_snapshot!(exact_complex.display(&db), @"complex*");
+        assert_snapshot!(float_annotation.display(&db), @"float");
+        assert_snapshot!(complex_annotation.display(&db), @"complex");
+        assert_eq!(
+            float_annotation
+                .display_with(
+                    &db,
+                    DisplaySettings::default().expand_numeric_tower_unions(),
+                )
+                .to_string(),
+            "int | float*"
+        );
+        assert_eq!(
+            complex_annotation
+                .display_with(
+                    &db,
+                    DisplaySettings::default().expand_numeric_tower_unions(),
+                )
+                .to_string(),
+            "int | float* | complex*"
+        );
+        assert_snapshot!(float_annotation.to_meta_type(&db).display(&db), @"type[float]");
+        assert_snapshot!(complex_annotation.to_meta_type(&db).display(&db), @"type[complex]");
+
+        let list_of_float = KnownClass::List.to_specialized_instance(&db, &[float_annotation]);
+        assert_snapshot!(list_of_float.display(&db), @"list[float]");
+
+        let string_or_float =
+            UnionType::from_elements(&db, [KnownClass::Str.to_instance(&db), float_annotation]);
+        assert_snapshot!(string_or_float.display(&db), @"str | float");
+
+        assert!(!exact_float.display(&db).to_string_parts().is_valid_syntax);
+        assert!(
+            float_annotation
+                .display(&db)
+                .to_string_parts()
+                .is_valid_syntax
+        );
+        assert!(matches!(
+            float_annotation
+                .display(&db)
+                .to_string_parts()
+                .details
+                .as_slice(),
+            [TypeDetail::Type(Type::ClassLiteral(class))]
+                if class.known(&db) == Some(KnownClass::Float)
+        ));
     }
 
     fn display_signature<'db>(
