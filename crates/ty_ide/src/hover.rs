@@ -320,7 +320,10 @@ impl<'db> DisplayHoverContent<'_, 'db> {
         // Special types like `<special-form of whatever 'blahblah' with 'florps'>`
         // render poorly with python syntax-highlighting but well as xml
         let ty_string = ty
-            .display_with(self.db, DisplaySettings::default().multiline())
+            .display_with(
+                self.db,
+                DisplaySettings::from_possibly_ambiguous_types(self.db, [*ty]).multiline(),
+            )
             .to_string();
         let syntax = if ty_string.starts_with('<') {
             "xml"
@@ -6064,6 +6067,22 @@ def function():
           |    |
           |    source
         ");
+    }
+
+    #[test]
+    fn hover_shadowed_numeric_builtin() {
+        let test = hover_test(
+            r#"
+            import builtins
+
+            class float: ...
+
+            def f(x: builtins.float | float):
+                x<CURSOR>
+            "#,
+        );
+
+        assert_snapshot!(test.hover());
     }
 
     #[test]
