@@ -2211,7 +2211,17 @@ impl Display for DisplayCallableType<'_, '_> {
 
 impl<'db> Signature<'db> {
     pub(crate) fn display<'a>(&'a self, db: &'db dyn Db) -> DisplaySignature<'a, 'db> {
-        Self::display_with(self, db, DisplaySettings::default())
+        Self::display_with(self, db, self.display_settings(db))
+    }
+
+    pub(crate) fn display_settings(&self, db: &'db dyn Db) -> DisplaySettings<'db> {
+        DisplaySettings::from_possibly_ambiguous_types(
+            db,
+            self.parameters()
+                .iter()
+                .map(Parameter::annotated_type)
+                .chain(std::iter::once(self.return_ty)),
+        )
     }
 
     pub(crate) fn display_with<'a>(
