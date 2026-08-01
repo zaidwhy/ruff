@@ -10,7 +10,7 @@ use std::fmt::Formatter;
 use ty_python_semantic::types::ide_support::{resolved_call_signature, typed_dict_key_hover};
 use ty_python_semantic::types::{KnownInstanceType, Type, TypeAliasType, TypeVarVariance};
 
-use ty_python_semantic::{DisplaySettings, SemanticModel, TypeQualifiers};
+use ty_python_semantic::{SemanticModel, TypeQualifiers};
 
 pub fn hover(db: &dyn Db, file: File, offset: TextSize) -> Option<RangedValue<Hover<'_>>> {
     let parsed = parsed_module(db, file).load(db);
@@ -319,12 +319,7 @@ impl<'db> DisplayHoverContent<'_, 'db> {
     fn ty_string_and_syntax(&self, ty: &Type<'db>) -> (String, &'static str) {
         // Special types like `<special-form of whatever 'blahblah' with 'florps'>`
         // render poorly with python syntax-highlighting but well as xml
-        let ty_string = ty
-            .display_with(
-                self.db,
-                DisplaySettings::from_possibly_ambiguous_types(self.db, [*ty]).multiline(),
-            )
-            .to_string();
+        let ty_string = ty.display(self.db).multiline().to_string();
         let syntax = if ty_string.starts_with('<') {
             "xml"
         } else {

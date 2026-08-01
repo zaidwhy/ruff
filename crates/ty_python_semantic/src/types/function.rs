@@ -2856,11 +2856,7 @@ pub(super) fn report_revealed_type<'db>(
         diag.annotate(
             Annotation::primary(context.span(argument_node)).message(format_args!(
                 "`{}`",
-                revealed_type.display_with(
-                    context.db(),
-                    DisplaySettings::from_possibly_ambiguous_types(context.db(), [revealed_type],)
-                        .preserve_long_unions()
-                )
+                revealed_type.display(context.db()).preserve_long_unions()
             )),
         );
     }

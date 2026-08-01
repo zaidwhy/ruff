@@ -1720,11 +1720,7 @@ pub fn call_type_simplified_by_overloads(
     }
 
     let signature = resolve_single_overload(model, callable_type, call_expr)?;
-    Some(
-        signature
-            .display_with(db, signature.display_settings(db).multiline())
-            .to_string(),
-    )
+    Some(signature.display(db).multiline().to_string())
 }
 
 /// Returns the definitions of the binary operation along with its callable type.
@@ -2941,14 +2937,10 @@ pub fn constructor_signature(model: &SemanticModel, call_expr: &ast::ExprCall) -
     let class_name = function_ty.as_class_literal()?.name(db);
     let display_sig = |signature: &Signature| {
         let params = signature
-            .display_with(
-                db,
-                signature
-                    .display_settings(db)
-                    .multiline()
-                    .disallow_signature_name()
-                    .hide_return_type(),
-            )
+            .display(db)
+            .multiline()
+            .disallow_name()
+            .hide_return_type()
             .to_string();
 
         format!("class {class_name}{params}")
