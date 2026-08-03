@@ -1,8 +1,12 @@
 use compact_str::CompactString;
 use rayon::prelude::*;
-use ruff_db::{PythonFile, files::File};
-use ty_module_resolver::{Module, ModuleName, all_modules, resolve_real_shadowable_module};
+use ruff_db::{PythonFile, files::File, parsed::parsed_module};
+use rustc_hash::FxHashSet;
+use ty_module_resolver::{
+    Module, ModuleName, SearchPath, all_modules, resolve_module, resolve_real_shadowable_module,
+};
 use ty_project::{Db, parallel::ParallelIteratorExt};
+use ty_python_core::{definition::DefinitionKind, global_scope, use_def_map};
 
 use crate::{
     SymbolKind,
@@ -29,6 +33,7 @@ pub fn all_symbols<'db>(
     let typing_extensions = ModuleName::new_static("typing_extensions").unwrap();
     let is_typing_extensions_available = importing_from.file(db).is_stub(db)
         || resolve_real_shadowable_module(db, importing_from, &typing_extensions).is_some();
+    let enabled_typeshed_modules = enabled_typeshed_modules(db, importing_from);
 
     let results = all_modules(db, importing_from.python_version(db))
         .into_par_iter()
@@ -45,13 +50,28 @@ pub fn all_symbols<'db>(
 
             // Filter out non-first-party modules that are conventionally
             // regarded as private or tests.
-            if is_non_first_party && (name.is_private() || name.is_test_module()) {
+            if is_non_first_party
+                && (name.is_test_module()
+                    || name.is_private() && !enabled_typeshed_modules.contains(&module))
+            {
                 return Vec::new();
             }
 
             // TODO: also make it available in `TYPE_CHECKING` blocks
             // (we'd need https://github.com/astral-sh/ty/issues/1553 to do this well)
-            if !is_typing_extensions_available && name == &typing_extensions {
+            if !is_typing_extensions_available
+                && name == &typing_extensions
+                && !enabled_typeshed_modules.contains(&module)
+            {
+                return Vec::new();
+            }
+
+            if name.first_component() == "ty_extensions"
+                && module
+                    .search_path(db)
+                    .is_some_and(SearchPath::is_standard_library)
+                && !enabled_typeshed_modules.contains(&module)
+            {
                 return Vec::new();
             }
 
@@ -90,6 +110,76 @@ pub fn all_symbols<'db>(
         .collect();
 
     merge::merge(db, results)
+}
+
+/// Returns bundled typeshed modules made available by existing imports in this file.
+#[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
+fn enabled_typeshed_modules<'db>(
+    db: &'db dyn Db,
+    importing_from: PythonFile<'db>,
+) -> FxHashSet<Module<'db>> {
+    let mut enabled_typeshed_modules = FxHashSet::default();
+
+    // Certain bundled typeshed modules are unavailable at runtime: `_typeshed`, `ty_extensions`,
+    // and, unless installed, `typing_extensions`, together with their submodules. We usually
+    // exclude them from auto-import suggestions. An existing import from one of these families,
+    // including an import guarded by `TYPE_CHECKING`, signals that typeshed-only imports are
+    // appropriate, so enable the entire family.
+    let mut enable_imported_typeshed_family = |module_name: ModuleName| {
+        // We only consider imports written in this module; following imports through other
+        // modules would be unnecessarily expensive.
+        let first_component = match module_name.first_component() {
+            "_typeshed" => "_typeshed",
+            "typing_extensions" => "typing_extensions",
+            "ty_extensions" => "ty_extensions",
+            _ => return,
+        };
+        let top_level_module_name = ModuleName::new_static(first_component).unwrap();
+        let Some(top_level_module) = resolve_module(db, importing_from, &top_level_module_name)
+        else {
+            return;
+        };
+        if !top_level_module
+            .search_path(db)
+            .is_some_and(SearchPath::is_standard_library)
+        {
+            return;
+        }
+        enabled_typeshed_modules.extend(
+            module_name
+                .ancestors()
+                .filter_map(|ancestor| resolve_module(db, importing_from, &ancestor))
+                .flat_map(|ancestor| {
+                    std::iter::once(ancestor).chain(ancestor.all_submodules(db).iter().copied())
+                }),
+        );
+    };
+
+    let parsed = parsed_module(db, importing_from).load(db);
+    let definitions = use_def_map(db, global_scope(db, importing_from));
+    for (_, state, _) in definitions.all_definitions_with_usage() {
+        let Some(definition) = state.definition() else {
+            continue;
+        };
+
+        let module_name = match definition.kind(db) {
+            DefinitionKind::Import(import) => ModuleName::new(import.alias(&parsed).name.as_str()),
+            DefinitionKind::ImportFrom(import) => {
+                ModuleName::from_import_statement(db, importing_from, import.import(&parsed)).ok()
+            }
+            DefinitionKind::StarImport(import) => {
+                ModuleName::from_import_statement(db, importing_from, import.import(&parsed)).ok()
+            }
+            _ => None,
+        };
+
+        if let Some(module_name) = module_name {
+            enable_imported_typeshed_family(module_name);
+        }
+    }
+
+    enabled_typeshed_modules.shrink_to_fit();
+    enabled_typeshed_modules
 }
 
 /// A symbol found in the workspace and dependencies, including the
