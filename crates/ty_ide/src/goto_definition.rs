@@ -134,6 +134,175 @@ def f(items):
     }
 
     #[test]
+    fn goto_definition_pytest_fixture_from_test_parameter() {
+        let test = pytest_cursor_test(
+            r#"
+            import pytest
+
+            @pytest.fixture
+            def resource(): ...
+
+            def test_use(resource<CURSOR>): ...
+            "#,
+        );
+
+        assert_snapshot!(test.goto_definition(), @"
+        info[goto-definition]: Go to definition
+         --> src/test_example.py:7:14
+          |
+        7 | def test_use(resource): ...
+          |              ^^^^^^^^ Clicking here
+        info: Found 1 definition
+         --> src/test_example.py:5:5
+          |
+        5 | def resource(): ...
+          |     --------
+        ");
+    }
+
+    #[test]
+    fn goto_definition_pytest_fixture_dependency() {
+        let test = pytest_cursor_test(
+            r#"
+            import pytest
+
+            @pytest.fixture
+            def parent(): ...
+
+            @pytest.fixture
+            def child(parent<CURSOR>): ...
+            "#,
+        );
+
+        assert_snapshot!(test.goto_definition(), @"
+        info[goto-definition]: Go to definition
+         --> src/test_example.py:8:11
+          |
+        8 | def child(parent): ...
+          |           ^^^^^^ Clicking here
+        info: Found 1 definition
+         --> src/test_example.py:5:5
+          |
+        5 | def parent(): ...
+          |     ------
+        ");
+    }
+
+    #[test]
+    fn goto_definition_prefers_pytest_class_fixture() {
+        let test = pytest_cursor_test(
+            r#"
+            import pytest
+
+            @pytest.fixture
+            def resource(): ...
+
+            class TestExample:
+                @pytest.fixture
+                def resource(self): ...
+
+                def test_use(self, resource<CURSOR>): ...
+            "#,
+        );
+
+        assert_snapshot!(test.goto_definition(), @"
+        info[goto-definition]: Go to definition
+          --> src/test_example.py:11:24
+           |
+        11 |     def test_use(self, resource): ...
+           |                        ^^^^^^^^ Clicking here
+        info: Found 1 definition
+         --> src/test_example.py:9:9
+          |
+        9 |     def resource(self): ...
+          |         --------
+        ");
+    }
+
+    #[test]
+    fn goto_definition_pytest_fixture_with_explicit_name() {
+        let test = pytest_cursor_test(
+            r#"
+            import pytest
+
+            @pytest.fixture(name="resource")
+            def implementation(): ...
+
+            def test_use(resource<CURSOR>): ...
+            "#,
+        );
+
+        assert_snapshot!(test.goto_definition(), @"
+        info[goto-definition]: Go to definition
+         --> src/test_example.py:7:14
+          |
+        7 | def test_use(resource): ...
+          |              ^^^^^^^^ Clicking here
+        info: Found 1 definition
+         --> src/test_example.py:5:5
+          |
+        5 | def implementation(): ...
+          |     --------------
+        ");
+    }
+
+    #[test]
+    fn goto_definition_pytest_indirect_parameter() {
+        let test = pytest_cursor_test(
+            r#"
+            import pytest
+
+            @pytest.fixture
+            def resource(): ...
+
+            @pytest.mark.parametrize("resource", [1], indirect=True)
+            def test_use(resource<CURSOR>): ...
+            "#,
+        );
+
+        assert_snapshot!(test.goto_definition(), @"
+        info[goto-definition]: Go to definition
+         --> src/test_example.py:8:14
+          |
+        8 | def test_use(resource): ...
+          |              ^^^^^^^^ Clicking here
+        info: Found 1 definition
+         --> src/test_example.py:5:5
+          |
+        5 | def resource(): ...
+          |     --------
+        ");
+    }
+
+    #[test]
+    fn goto_definition_pytest_direct_parameter_falls_back() {
+        let test = pytest_cursor_test(
+            r#"
+            import pytest
+
+            @pytest.fixture
+            def resource(): ...
+
+            @pytest.mark.parametrize("resource", [1])
+            def test_use(resource<CURSOR>): ...
+            "#,
+        );
+
+        assert_snapshot!(test.goto_definition(), @"
+        info[goto-definition]: Go to definition
+         --> src/test_example.py:8:14
+          |
+        8 | def test_use(resource): ...
+          |              ^^^^^^^^ Clicking here
+        info: Found 1 definition
+         --> src/test_example.py:8:14
+          |
+        8 | def test_use(resource): ...
+          |              --------
+        ");
+    }
+
+    #[test]
     fn goto_definition_imported_comprehension_walrus() {
         let test = CursorTest::builder()
             .source("lib.py", "[(last := item) for item in [1]]\n")
@@ -2747,5 +2916,39 @@ class GenericFoo[T](Base):
                 GotoAction::Implementation => "implementation",
             }
         }
+    }
+
+    fn pytest_cursor_test(source: &str) -> CursorTest {
+        CursorTest::builder()
+            .with_site_packages()
+            .source("test_example.py", source)
+            .site_packages("_pytest/__init__.pyi", "")
+            .site_packages(
+                "_pytest/fixtures.pyi",
+                r#"
+                from typing import Any, Callable
+
+                def fixture(
+                    function: Callable[..., Any] | None = ...,
+                    *,
+                    name: str | None = ...,
+                ) -> Any: ...
+                "#,
+            )
+            .site_packages(
+                "pytest/__init__.pyi",
+                r#"
+                from _pytest.fixtures import fixture as fixture
+
+                class MarkDecorator:
+                    def __call__(self, *args: object, **kwargs: object) -> object: ...
+
+                class MarkGenerator:
+                    parametrize: MarkDecorator
+
+                mark: MarkGenerator
+                "#,
+            )
+            .build()
     }
 }
