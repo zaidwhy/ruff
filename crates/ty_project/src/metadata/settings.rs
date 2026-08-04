@@ -5,8 +5,8 @@ use ty_combine::Combine;
 use ty_python_semantic::AnalysisSettings;
 use ty_python_semantic::lint::RuleSelection;
 
-use crate::metadata::options::{InnerOverrideOptions, Options, OutputFormat};
-use crate::metadata::script::script_metadata;
+use crate::metadata::options::{InnerOverrideOptions, OutputFormat};
+use crate::metadata::script::{Script, script};
 use crate::{Db, glob::IncludeExcludeFilter};
 
 /// The resolved [`super::Options`] for the project.
@@ -124,38 +124,12 @@ impl Override {
 
 /// Resolves the settings for a given file.
 #[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
-pub(crate) fn file_settings(db: &dyn Db, file: File) -> FileSettings {
-    let project = db.project();
-
-    // Ignore script settings for files that aren't checked as part of the project. Check for
-    // metadata first so files without metadata don't depend on the low-durability open-file set.
-    if let Some(script) = script_metadata(db, file)
-        && crate::should_check_file(db, file)
-    {
-        let inline = script.ty().cloned().unwrap_or_default();
-        let metadata = project.metadata(db);
-        let primary = if metadata.config_file_override().is_some() {
-            metadata.options()
-        } else {
-            &inline
-        };
-        let mut options = metadata
-            .options_in_precedence_order(primary)
-            .map(Options::file_options);
-        let mut merged = options.next().unwrap_or_default();
-
-        for option in options {
-            merged.combine_with(option);
-        }
-
-        let rules = merged.rules.unwrap_or_default();
-        let analysis = merged.analysis.unwrap_or_default();
-
-        let rules = rules.to_rule_selection(db, &mut Vec::new());
-        let analysis = analysis.to_settings(db, &mut Vec::new());
-
-        return FileSettings::File(Arc::new(OverrideSettings { rules, analysis }));
+pub(crate) fn file_settings(db: &dyn Db, file: File) -> FileSettings<'_> {
+    if let Some(script) = script(db, file) {
+        return FileSettings::Script(script);
     }
+
+    let project = db.project();
 
     let settings = project.settings(db);
 
@@ -215,7 +189,11 @@ pub(crate) fn file_settings(db: &dyn Db, file: File) -> FileSettings {
 /// take a salsa-struct as argument, which isn't the case here. The `()` enables salsa's
 /// automatic interning for the arguments.
 #[salsa::tracked(returns(clone), heap_size=ruff_memory_usage::heap_size)]
-fn merge_overrides(db: &dyn Db, overrides: Vec<Arc<InnerOverrideOptions>>, _: ()) -> FileSettings {
+fn merge_overrides(
+    db: &dyn Db,
+    overrides: Vec<Arc<InnerOverrideOptions>>,
+    _: (),
+) -> FileSettings<'_> {
     let mut overrides = overrides.into_iter().rev();
     let mut merged = (*overrides.next().unwrap()).clone();
 
@@ -248,19 +226,23 @@ fn merge_overrides(db: &dyn Db, overrides: Vec<Arc<InnerOverrideOptions>>, _: ()
 }
 
 /// The resolved settings for a file.
-#[derive(Debug, Eq, PartialEq, Clone, get_size2::GetSize)]
-pub enum FileSettings {
+#[derive(Debug, Eq, PartialEq, Clone, get_size2::GetSize, salsa::SalsaValue)]
+pub(crate) enum FileSettings<'db> {
     /// The file uses the global settings.
     Global,
+
+    /// The file is a standalone script with independently resolved settings.
+    Script(Script<'db>),
 
     /// The file has specific override settings.
     File(Arc<OverrideSettings>),
 }
 
-impl FileSettings {
+impl FileSettings<'_> {
     pub(crate) fn rules<'a>(&'a self, db: &'a dyn Db) -> &'a RuleSelection {
         match self {
             FileSettings::Global => db.project().settings(db).rules(),
+            FileSettings::Script(script) => script.settings(db).rules(),
             FileSettings::File(override_settings) => &override_settings.rules,
         }
     }
@@ -268,6 +250,7 @@ impl FileSettings {
     pub(crate) fn analysis<'a>(&'a self, db: &'a dyn Db) -> &'a AnalysisSettings {
         match self {
             FileSettings::Global => db.project().settings(db).analysis(),
+            FileSettings::Script(script) => script.settings(db).analysis(),
             FileSettings::File(override_settings) => &override_settings.analysis,
         }
     }
