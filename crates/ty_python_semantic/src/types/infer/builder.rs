@@ -10303,6 +10303,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 PlaceExprRef::from(&place_expr),
                 ast::ExprRef::Attribute(attribute),
             );
+            constraint_keys.extend(keys);
             if let Place::Defined(DefinedPlace {
                 ty,
                 definedness: Definedness::AlwaysDefined,
@@ -10311,7 +10312,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             {
                 assigned_type = Some(ty);
             }
-            constraint_keys.extend(keys);
         }
         let fallback = value_type.member_with_diagnostics(db, env, &attr.id);
         if !matches!(attribute.ctx, ExprContext::Del)
