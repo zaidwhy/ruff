@@ -84,6 +84,29 @@ fn verbose_rule_diagnostics_identify_script_metadata() -> anyhow::Result<()> {
 }
 
 #[test]
+fn unknown_rule_diagnostics_point_to_script_metadata() -> anyhow::Result<()> {
+    let case = CliTest::with_file(
+        "script.py",
+        r#"
+        # /// script
+        # [tool.ty.rules]
+        # unknown-script-rule = "warn"
+        # ///
+        "#,
+    )?;
+    let output = case.command().output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+
+    assert!(stdout.contains("--> script.py:4:3"), "{stdout}");
+    assert!(
+        stdout.contains("# unknown-script-rule = \"warn\""),
+        "{stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn python_version_diagnostics_identify_script_metadata() -> anyhow::Result<()> {
     let case = CliTest::with_file(
         "script.py",
@@ -96,7 +119,7 @@ fn python_version_diagnostics_identify_script_metadata() -> anyhow::Result<()> {
         "#,
     )?;
 
-    assert_cmd_snapshot!(case.command(), @"
+    assert_cmd_snapshot!(case.command(), @r#"
     success: false
     exit_code: 1
     ----- stdout -----
@@ -107,11 +130,15 @@ fn python_version_diagnostics_identify_script_metadata() -> anyhow::Result<()> {
       | ^^^^^^^^^^^^^^^^^^^^^^^
     info: `PythonFinalizationError` was added as a builtin in Python 3.13
     info: Python 3.12 was assumed when resolving types because it was specified in script metadata
+     --> script.py:3:21
+      |
+    3 | # requires-python = ">=3.12"
+      |                     ^^^^^^^^ Python version configured here
 
     Found 1 diagnostic
 
     ----- stderr -----
-    ");
+    "#);
     assert_cmd_snapshot!(case.command().arg("--output-format").arg("concise"), @"
     success: false
     exit_code: 1

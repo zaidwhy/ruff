@@ -170,10 +170,10 @@ pub(crate) fn script_metadata(db: &dyn SourceDb, file: File) -> Option<Box<Scrip
         return None;
     }
 
-    let tag = ScriptTag::parse(source.as_bytes())?;
-    let _guard = ValueSourceGuard::new(ValueSource::ScriptMetadata(file), false);
+    let (content, source_map) = ScriptTag::parse(source.as_bytes())?.into_metadata_and_source_map();
+    let _guard = ValueSourceGuard::with_source_map(ValueSource::ScriptMetadata(file), source_map);
     // FIXME: Report invalid TOML in script metadata instead of silently ignoring it.
-    let mut metadata: ScriptMetadata = toml::from_str(tag.metadata()).ok()?;
+    let mut metadata: ScriptMetadata = toml::from_str(&content).ok()?;
 
     if let Some(options) = metadata.tool.as_mut().and_then(|tool| tool.ty.as_mut()) {
         options.prioritize_all_selectors();
@@ -209,12 +209,13 @@ mod tests {
     use ruff_db::files::system_path_to_file;
     use ruff_db::system::{DbWithWritableSystem as _, SystemPath, SystemPathBuf};
     use ruff_db::testing::assert_function_query_was_not_run;
-    use ty_python_semantic::Db as _;
+    use ruff_text_size::{TextLen, TextRange, TextSize};
+    use ty_python_semantic::{Db as _, PythonVersionSource};
 
     use crate::db::testing::TestDb;
     use crate::{Db as _, ProjectMetadata};
 
-    use super::script;
+    use super::{script, script_metadata};
 
     #[test]
     fn ordinary_files_do_not_depend_on_open_files() -> anyhow::Result<()> {
@@ -278,6 +279,90 @@ mod tests {
         assert_ne!(
             db.python_version_with_source(requirement),
             db.python_version_with_source(configured)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn script_metadata_ranges_are_mapped_to_the_original_source() -> anyhow::Result<()> {
+        let mut db = TestDb::new(ProjectMetadata::new(
+            "test",
+            SystemPathBuf::from("/project"),
+        ));
+        let contents = "π = 1\r\n# /// script\r\n# requires-python = \">=3.12\"\r\n#\r\n# [tool.ty.rules]\r\n# unknown-script-rule = \"warn\"\r\n# ///\r\n";
+        db.write_files([("/project/script.py", contents)])?;
+        let file = system_path_to_file(&db, SystemPath::new("/project/script.py"))?;
+        let metadata = script_metadata(&db, file)
+            .ok_or_else(|| anyhow::anyhow!("Expected the file to contain script metadata"))?;
+        let requirement = metadata
+            .requires_python
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Expected a Python requirement"))?;
+        let version_start = contents
+            .find("\">=3.12\"")
+            .ok_or_else(|| anyhow::anyhow!("Expected the Python requirement in the script"))?;
+        let expected_version_range =
+            TextRange::at(TextSize::try_from(version_start)?, "\">=3.12\"".text_len());
+
+        assert_eq!(requirement.range(), Some(expected_version_range));
+
+        let script = script(&db, file)
+            .ok_or_else(|| anyhow::anyhow!("Expected the file to resolve as a script"))?;
+
+        let diagnostic = script
+            .diagnostics(&db)
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("Expected an unknown-rule diagnostic"))?;
+        let rule_start = contents
+            .find("unknown-script-rule")
+            .ok_or_else(|| anyhow::anyhow!("Expected the unknown rule in the script"))?;
+
+        assert_eq!(
+            diagnostic.expect_primary_span().range(),
+            Some(TextRange::at(
+                TextSize::try_from(rule_start)?,
+                "unknown-script-rule".text_len()
+            ))
+        );
+
+        let PythonVersionSource::ScriptMetadata(span) =
+            &script.python_version_with_source(&db).source
+        else {
+            anyhow::bail!("Expected the Python version to originate in script metadata");
+        };
+        assert_eq!(span.range(), Some(expected_version_range));
+
+        Ok(())
+    }
+
+    #[test]
+    fn configured_python_version_range_points_to_nested_script_option() -> anyhow::Result<()> {
+        let mut db = TestDb::new(ProjectMetadata::new(
+            "test",
+            SystemPathBuf::from("/project"),
+        ));
+        let contents =
+            "# /// script\n# [tool.ty.environment]\n# python-version = \"3.11\"\n# ///\n";
+        db.write_files([("/project/script.py", contents)])?;
+        let file = system_path_to_file(&db, SystemPath::new("/project/script.py"))?;
+        let script = script(&db, file)
+            .ok_or_else(|| anyhow::anyhow!("Expected the file to resolve as a script"))?;
+        let PythonVersionSource::ScriptMetadata(span) =
+            &script.python_version_with_source(&db).source
+        else {
+            anyhow::bail!("Expected the Python version to originate in script metadata");
+        };
+        let version_start = contents
+            .find("\"3.11\"")
+            .ok_or_else(|| anyhow::anyhow!("Expected the Python version in the script"))?;
+
+        assert_eq!(
+            span.range(),
+            Some(TextRange::at(
+                TextSize::try_from(version_start)?,
+                "\"3.11\"".text_len()
+            ))
         );
 
         Ok(())

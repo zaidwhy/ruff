@@ -548,11 +548,11 @@ pub(super) fn to_lsp_diagnostic(
         diagnostic.concise_message().to_string()
     };
 
-    // Append info sub-diagnostics that have no location (and thus
-    // can't be shown as "related information") to the message.
+    // Append sub-diagnostics to the message if the client cannot display related information or
+    // the sub-diagnostic has no location to associate with that information.
     let mut first = true;
     for sub_diagnostic in diagnostic.sub_diagnostics() {
-        if sub_diagnostic.primary_annotation().is_none() {
+        if !supports_related_information || sub_diagnostic.primary_annotation().is_none() {
             if first {
                 message.push('\n');
                 first = false;

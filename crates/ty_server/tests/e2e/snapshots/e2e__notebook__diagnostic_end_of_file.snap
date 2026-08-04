@@ -94,7 +94,7 @@ expression: diagnostics
         "href": "https://ty.dev/rules#invalid-argument-type"
       },
       "source": "ty",
-      "message": "Argument to function `with_style` is incorrect: Expected `Style`, found `Literal[\", \"]`"
+      "message": "Argument to function `with_style` is incorrect: Expected `Style`, found `Literal[\", \"]`\n\ninfo: Function defined here"
     },
     {
       "range": {
@@ -129,7 +129,7 @@ expression: diagnostics
         "href": "https://ty.dev/rules#too-many-positional-arguments"
       },
       "source": "ty",
-      "message": "Too many positional arguments to function `with_style`: expected 3, got 6"
+      "message": "Too many positional arguments to function `with_style`: expected 3, got 6\n\ninfo: Function signature here"
     },
     {
       "range": {

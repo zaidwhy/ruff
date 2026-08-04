@@ -1,14 +1,13 @@
-use ruff_text_size::{Ranged, TextSize};
+use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::Edit;
 
-/// Lightweight sourcemap marker representing the source and destination
-/// position for an [`Edit`].
-#[derive(Debug, PartialEq, Eq)]
+/// A pair of corresponding byte offsets in a source and its destination.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceMarker {
-    /// Position of the marker in the original source.
+    /// Position of the marker in the input being mapped.
     source: TextSize,
-    /// Position of the marker in the transformed code.
+    /// Corresponding position in the destination.
     dest: TextSize,
 }
 
@@ -26,17 +25,36 @@ impl SourceMarker {
     }
 }
 
-/// A collection of [`SourceMarker`].
+/// An ordered collection of [`SourceMarker`]s.
 ///
-/// Sourcemaps are used to map positions in the original source to positions in
-/// the transformed code. Here, only the boundaries of edits are tracked instead
-/// of every single character.
+/// Markers record where the displacement between source and destination changes instead of
+/// tracking every byte individually. Existing edit maps use original Python source as the input;
+/// embedded metadata maps use extracted TOML as the input and Python source as the destination.
 ///
 /// This mapping maintains the invariant that markers are in source order.
-#[derive(Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SourceMap(Vec<SourceMarker>);
 
 impl SourceMap {
+    /// Maps an input offset to the corresponding destination offset.
+    pub fn map_offset(&self, offset: TextSize) -> TextSize {
+        let Some(index) = self
+            .0
+            .partition_point(|marker| marker.source <= offset)
+            .checked_sub(1)
+        else {
+            return offset;
+        };
+        let marker = &self.0[index];
+
+        marker.dest + (offset - marker.source)
+    }
+
+    /// Maps a range by translating both endpoints independently.
+    pub fn map_range(&self, range: TextRange) -> TextRange {
+        TextRange::new(self.map_offset(range.start()), self.map_offset(range.end()))
+    }
+
     /// Returns a slice of all the markers in the sourcemap in source order.
     pub fn markers(&self) -> &[SourceMarker] {
         &self.0
