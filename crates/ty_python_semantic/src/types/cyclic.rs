@@ -105,34 +105,6 @@ impl<'db> Type<'db> {
         }
     }
 
-    /// Returns `false` if cheap inspection proves that `self` and `other` cannot have the same
-    /// [`TypeIdentity`].
-    ///
-    /// This is a hot-path filter and must not walk either type. A `true` result is only a candidate
-    /// match and must be confirmed with [`Type::to_type_identity`].
-    pub(crate) fn may_share_type_identity(self, db: &'db dyn Db, other: Self) -> bool {
-        if self == other {
-            return true;
-        }
-        match (self, other) {
-            (Type::FunctionLiteral(a), Type::FunctionLiteral(b)) => a.literal(db) == b.literal(db),
-            (Type::NewTypeInstance(a), Type::NewTypeInstance(b)) => {
-                a.definition(db) == b.definition(db)
-            }
-            (Type::NominalInstance(a), Type::NominalInstance(b)) => {
-                a.definition(db) == b.definition(db)
-            }
-            (Type::ProtocolInstance(a), Type::ProtocolInstance(b)) => {
-                a.definition(db) == b.definition(db)
-            }
-            (Type::TypeAlias(a), Type::TypeAlias(b)) => a.definition(db) == b.definition(db),
-            (Type::TypedDict(a), Type::TypedDict(b)) => a.definition(db) == b.definition(db),
-            (Type::GenericAlias(_) | Type::SubclassOf(_), _)
-            | (_, Type::GenericAlias(_) | Type::SubclassOf(_)) => true,
-            _ => false,
-        }
-    }
-
     /// Returns `false` if cheap inspection proves that `self` cannot grow from `active` in a type
     /// relation cycle.
     pub(crate) fn may_share_relation_type_identity(self, db: &'db dyn Db, active: Self) -> bool {
@@ -152,7 +124,16 @@ impl<'db> Type<'db> {
             }
             (Type::GenericAlias(_) | Type::SubclassOf(_), _)
             | (_, Type::GenericAlias(_) | Type::SubclassOf(_)) => return true,
-            _ => return self.may_share_type_identity(db, active),
+            (Type::FunctionLiteral(a), Type::FunctionLiteral(b)) => {
+                return a.literal(db) == b.literal(db);
+            }
+            (Type::NewTypeInstance(a), Type::NewTypeInstance(b)) => {
+                return a.definition(db) == b.definition(db);
+            }
+            (Type::TypeAlias(a), Type::TypeAlias(b)) => {
+                return a.definition(db) == b.definition(db);
+            }
+            _ => return false,
         };
 
         let (Some(current), Some(active)) = specializations else {
@@ -497,10 +478,6 @@ pub trait HasIdentity<'db> {
 impl<'db> HasIdentity<'db> for Type<'db> {
     type Id = TypeIdentity<'db>;
 
-    fn may_share_identity(&self, db: &'db dyn Db, other: &Self) -> bool {
-        self.may_share_type_identity(db, *other)
-    }
-
     fn to_identity(&self, db: &'db dyn Db) -> Self::Id {
         Type::to_type_identity(*self, db)
     }
@@ -742,15 +719,11 @@ impl<'db, Tag> TypeTransformer<'db, Tag> {
             return TypeTransformerVisit::Ready(ty);
         }
 
-        let mut candidates = seen
-            .iter()
-            .filter(|active| ty.may_share_type_identity(db, active.ty))
-            .peekable();
-        let identity = if candidates.peek().is_none() {
+        let identity = if seen.is_empty() {
             OnceCell::new()
         } else {
             let identity = ty.to_type_identity(db);
-            if candidates.any(|active: &ActiveTypeTransformation<'db>| {
+            if seen.iter().any(|active| {
                 active
                     .identity
                     .get_or_init(|| active.ty.to_type_identity(db))
