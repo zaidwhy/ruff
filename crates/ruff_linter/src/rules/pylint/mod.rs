@@ -277,6 +277,20 @@ mod tests {
         Ok(())
     }
 
+    #[test_case(PythonVersion::PY314)]
+    #[test_case(PythonVersion::PY315)]
+    fn preview_import_outside_top_level_fix(target_version: PythonVersion) -> Result<()> {
+        let snapshot = format!("preview_import_outside_top_level_fix_{target_version}");
+        let diagnostics = test_path(
+            Path::new("pylint/import_outside_top_level_fix.py"),
+            &LinterSettings::for_rule(Rule::ImportOutsideTopLevel)
+                .with_preview_mode()
+                .with_target_version(target_version),
+        )?;
+        assert_diagnostics!(snapshot, diagnostics);
+        Ok(())
+    }
+
     #[test]
     fn continue_in_finally() -> Result<()> {
         let diagnostics = test_path(

@@ -1,7 +1,7 @@
 ---
 source: crates/ruff_linter/src/rules/pylint/mod.rs
 ---
-PLC0415 `import` should be at the top-level of a file
+PLC0415 [*] `import` should be at the top-level of a file
   --> import_outside_top_level_with_banned.py:9:5
    |
  8 | def import_in_function():
@@ -10,8 +10,19 @@ PLC0415 `import` should be at the top-level of a file
 10 |     import os, sys  # [import-outside-toplevel]
 11 |     import time as thyme  # [import-outside-toplevel]
    |
+help: Move import to the top level as a lazy import
+   |
+1  | from typing import TYPE_CHECKING
+2  + lazy import symtable
+3  |
+--------------------------------------------------------------------------------
+9  | def import_in_function():
+   -     import symtable  # [import-outside-toplevel]
+10 |     import os, sys  # [import-outside-toplevel]
+   |
+note: This is an unsafe fix and may change runtime behavior
 
-PLC0415 `import` should be at the top-level of a file
+PLC0415 [*] `import` should be at the top-level of a file
   --> import_outside_top_level_with_banned.py:10:5
    |
  8 | def import_in_function():
@@ -21,8 +32,19 @@ PLC0415 `import` should be at the top-level of a file
 11 |     import time as thyme  # [import-outside-toplevel]
 12 |     import random as rand, socket as sock  # [import-outside-toplevel]
    |
+help: Move import to the top level as a lazy import
+   |
+1  | from typing import TYPE_CHECKING
+2  + lazy import os, sys
+3  |
+--------------------------------------------------------------------------------
+10 |     import symtable  # [import-outside-toplevel]
+   -     import os, sys  # [import-outside-toplevel]
+11 |     import time as thyme  # [import-outside-toplevel]
+   |
+note: This is an unsafe fix and may change runtime behavior
 
-PLC0415 `import` should be at the top-level of a file
+PLC0415 [*] `import` should be at the top-level of a file
   --> import_outside_top_level_with_banned.py:11:5
    |
  9 |     import symtable  # [import-outside-toplevel]
@@ -32,8 +54,19 @@ PLC0415 `import` should be at the top-level of a file
 12 |     import random as rand, socket as sock  # [import-outside-toplevel]
 13 |     from collections import defaultdict # [import-outside-toplevel]
    |
+help: Move import to the top level as a lazy import
+   |
+1  | from typing import TYPE_CHECKING
+2  + lazy import time as thyme
+3  |
+--------------------------------------------------------------------------------
+11 |     import os, sys  # [import-outside-toplevel]
+   -     import time as thyme  # [import-outside-toplevel]
+12 |     import random as rand, socket as sock  # [import-outside-toplevel]
+   |
+note: This is an unsafe fix and may change runtime behavior
 
-PLC0415 `import` should be at the top-level of a file
+PLC0415 [*] `import` should be at the top-level of a file
   --> import_outside_top_level_with_banned.py:12:5
    |
 10 |     import os, sys  # [import-outside-toplevel]
@@ -43,8 +76,19 @@ PLC0415 `import` should be at the top-level of a file
 13 |     from collections import defaultdict # [import-outside-toplevel]
 14 |     from math import sin as sign, cos as cosplay  # [import-outside-toplevel]
    |
+help: Move import to the top level as a lazy import
+   |
+1  | from typing import TYPE_CHECKING
+2  + lazy import random as rand, socket as sock
+3  |
+--------------------------------------------------------------------------------
+12 |     import time as thyme  # [import-outside-toplevel]
+   -     import random as rand, socket as sock  # [import-outside-toplevel]
+13 |     from collections import defaultdict # [import-outside-toplevel]
+   |
+note: This is an unsafe fix and may change runtime behavior
 
-PLC0415 `import` should be at the top-level of a file
+PLC0415 [*] `import` should be at the top-level of a file
   --> import_outside_top_level_with_banned.py:13:5
    |
 11 |     import time as thyme  # [import-outside-toplevel]
@@ -53,8 +97,19 @@ PLC0415 `import` should be at the top-level of a file
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 14 |     from math import sin as sign, cos as cosplay  # [import-outside-toplevel]
    |
+help: Move import to the top level as a lazy import
+   |
+1  | from typing import TYPE_CHECKING
+2  + lazy from collections import defaultdict
+3  |
+--------------------------------------------------------------------------------
+13 |     import random as rand, socket as sock  # [import-outside-toplevel]
+   -     from collections import defaultdict # [import-outside-toplevel]
+14 |     from math import sin as sign, cos as cosplay  # [import-outside-toplevel]
+   |
+note: This is an unsafe fix and may change runtime behavior
 
-PLC0415 `import` should be at the top-level of a file
+PLC0415 [*] `import` should be at the top-level of a file
   --> import_outside_top_level_with_banned.py:14:5
    |
 12 |     import random as rand, socket as sock  # [import-outside-toplevel]
@@ -64,6 +119,17 @@ PLC0415 `import` should be at the top-level of a file
 15 |
 16 |     # these should be allowed due to TID253 top-level ban
    |
+help: Move import to the top level as a lazy import
+   |
+1  | from typing import TYPE_CHECKING
+2  + lazy from math import sin as sign, cos as cosplay
+3  |
+--------------------------------------------------------------------------------
+14 |     from collections import defaultdict # [import-outside-toplevel]
+   -     from math import sin as sign, cos as cosplay  # [import-outside-toplevel]
+15 |
+   |
+note: This is an unsafe fix and may change runtime behavior
 
 PLC0415 `import` should be at the top-level of a file
   --> import_outside_top_level_with_banned.py:24:5
@@ -85,7 +151,7 @@ PLC0415 `import` should be at the top-level of a file
 29 |     def __init__(self):
    |
 
-PLC0415 `import` should be at the top-level of a file
+PLC0415 [*] `import` should be at the top-level of a file
   --> import_outside_top_level_with_banned.py:30:9
    |
 29 |     def __init__(self):
@@ -94,6 +160,17 @@ PLC0415 `import` should be at the top-level of a file
 31 |
 32 |         # these should be allowed due to TID253 top-level ban
    |
+help: Move import to the top level as a lazy import
+   |
+1  | from typing import TYPE_CHECKING
+2  + lazy import trace
+3  |
+--------------------------------------------------------------------------------
+30 |     def __init__(self):
+   -         import trace  # [import-outside-toplevel]
+31 |
+   |
+note: This is an unsafe fix and may change runtime behavior
 
 PLC0415 `import` should be at the top-level of a file
   --> import_outside_top_level_with_banned.py:40:9

@@ -78,11 +78,18 @@ impl<'a> Importer<'a> {
         } else {
             import.to_string()
         };
+        self.add_import_statement(&required_import, at)
+    }
+
+    /// Add the given import statement source code at the top level of the module.
+    ///
+    /// The statement is placed using the same rules as [`Importer::add_import`].
+    pub(crate) fn add_import_statement(&self, content: &str, at: TextSize) -> Edit {
         if let Some(stmt) = self.preceding_import(at) {
             // Insert after the last top-level import.
-            Insertion::end_of_statement(stmt, self.source, self.stylist).into_edit(&required_import)
+            Insertion::end_of_statement(stmt, self.source, self.stylist).into_edit(content)
         } else {
-            self.add_at_start(&required_import)
+            self.add_at_start(content)
         }
     }
 

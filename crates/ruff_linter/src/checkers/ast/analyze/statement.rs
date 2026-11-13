@@ -563,8 +563,13 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
             if checker.is_rule_enabled(Rule::ModuleImportNotAtTopOfFile) {
                 pycodestyle::rules::module_import_not_at_top_of_file(checker, stmt);
             }
-            if checker.is_rule_enabled(Rule::ImportOutsideTopLevel) {
-                pylint::rules::import_outside_top_level(checker, stmt);
+            if checker.is_rule_enabled(Rule::ImportOutsideTopLevel)
+                && !checker.semantic.current_scope().kind.is_module()
+            {
+                checker
+                    .analyze
+                    .imports_outside_top_level
+                    .push(checker.semantic.snapshot());
             }
             if checker.is_rule_enabled(Rule::GlobalStatement) {
                 for name in names {
@@ -725,8 +730,13 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
             if checker.is_rule_enabled(Rule::ModuleImportNotAtTopOfFile) {
                 pycodestyle::rules::module_import_not_at_top_of_file(checker, stmt);
             }
-            if checker.is_rule_enabled(Rule::ImportOutsideTopLevel) {
-                pylint::rules::import_outside_top_level(checker, stmt);
+            if checker.is_rule_enabled(Rule::ImportOutsideTopLevel)
+                && !checker.semantic.current_scope().kind.is_module()
+            {
+                checker
+                    .analyze
+                    .imports_outside_top_level
+                    .push(checker.semantic.snapshot());
             }
             if checker.is_rule_enabled(Rule::GlobalStatement) {
                 for name in names {

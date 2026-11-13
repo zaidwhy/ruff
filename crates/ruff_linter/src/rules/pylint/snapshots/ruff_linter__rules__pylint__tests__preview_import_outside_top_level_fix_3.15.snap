@@ -1,0 +1,266 @@
+---
+source: crates/ruff_linter/src/rules/pylint/mod.rs
+---
+PLC0415 [*] `import` should be at the top-level of a file
+  --> import_outside_top_level_fix.py:13:5
+   |
+12 | def simple():
+13 |     import os
+   |     ^^^^^^^^^
+14 |
+15 |     return os.getcwd()
+   |
+help: Move import to the top level as a lazy import
+   |
+4  | from typing import TYPE_CHECKING
+5  + lazy import os
+6  |
+--------------------------------------------------------------------------------
+13 | def simple():
+   -     import os
+14 |
+   |
+note: This is an unsafe fix and may change runtime behavior
+
+PLC0415 [*] `import` should be at the top-level of a file
+  --> import_outside_top_level_fix.py:19:5
+   |
+18 | def from_import_with_alias():
+19 |     from collections import OrderedDict as OD
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+20 |
+21 |     return OD()
+   |
+help: Move import to the top level as a lazy import
+   |
+4  | from typing import TYPE_CHECKING
+5  + lazy from collections import OrderedDict as OD
+6  |
+--------------------------------------------------------------------------------
+19 | def from_import_with_alias():
+   -     from collections import OrderedDict as OD
+20 |
+   |
+note: This is an unsafe fix and may change runtime behavior
+
+PLC0415 [*] `import` should be at the top-level of a file
+  --> import_outside_top_level_fix.py:25:5
+   |
+24 | def multiple_names():
+25 |     import json, csv
+   |     ^^^^^^^^^^^^^^^^
+26 |
+27 |     return json, csv
+   |
+help: Move import to the top level as a lazy import
+   |
+4  | from typing import TYPE_CHECKING
+5  + lazy import json, csv
+6  |
+--------------------------------------------------------------------------------
+25 | def multiple_names():
+   -     import json, csv
+26 |
+   |
+note: This is an unsafe fix and may change runtime behavior
+
+PLC0415 [*] `import` should be at the top-level of a file
+  --> import_outside_top_level_fix.py:31:5
+   |
+30 | def submodule():
+31 |     import xml.etree.ElementTree
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+32 |
+33 |     return xml.etree.ElementTree
+   |
+help: Move import to the top level as a lazy import
+   |
+4  | from typing import TYPE_CHECKING
+5  + lazy import xml.etree.ElementTree
+6  |
+--------------------------------------------------------------------------------
+31 | def submodule():
+   -     import xml.etree.ElementTree
+32 |
+   |
+note: This is an unsafe fix and may change runtime behavior
+
+PLC0415 [*] `import` should be at the top-level of a file
+  --> import_outside_top_level_fix.py:37:5
+   |
+36 | def only_statement():
+37 |     from itertools import chain
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: Move import to the top level as a lazy import
+   |
+4  | from typing import TYPE_CHECKING
+5  + lazy from itertools import chain
+6  |
+--------------------------------------------------------------------------------
+37 | def only_statement():
+   -     from itertools import chain
+38 +     pass
+39 |
+   |
+note: This is an unsafe fix and may change runtime behavior
+
+PLC0415 [*] `import` should be at the top-level of a file
+  --> import_outside_top_level_fix.py:42:9
+   |
+40 | class Class:
+41 |     def method(self):
+42 |         import base64
+   |         ^^^^^^^^^^^^^
+43 |
+44 |         return base64
+   |
+help: Move import to the top level as a lazy import
+   |
+4  | from typing import TYPE_CHECKING
+5  + lazy import base64
+6  |
+--------------------------------------------------------------------------------
+42 |     def method(self):
+   -         import base64
+43 |
+   |
+note: This is an unsafe fix and may change runtime behavior
+
+PLC0415 [*] `import` should be at the top-level of a file
+  --> import_outside_top_level_fix.py:48:5
+   |
+47 | def already_imported():
+48 |     import sys
+   |     ^^^^^^^^^^
+49 |
+50 |     return sys.argv
+   |
+help: Remove import already present at the top level
+   |
+47 | def already_imported():
+   -     import sys
+48 |
+   |
+note: This is an unsafe fix and may change runtime behavior
+
+PLC0415 `import` should be at the top-level of a file
+  --> import_outside_top_level_fix.py:58:9
+   |
+56 | def in_type_checking_block():
+57 |     if TYPE_CHECKING:
+58 |         import decimal
+   |         ^^^^^^^^^^^^^^
+
+PLC0415 `import` should be at the top-level of a file
+  --> import_outside_top_level_fix.py:63:9
+   |
+61 | def in_try():
+62 |     try:
+63 |         import numpy
+   |         ^^^^^^^^^^^^
+64 |     except ImportError:
+65 |         numpy = None
+   |
+
+PLC0415 `import` should be at the top-level of a file
+  --> import_outside_top_level_fix.py:71:9
+   |
+69 | def in_conditional(flag):
+70 |     if flag:
+71 |         import fractions
+   |         ^^^^^^^^^^^^^^^^
+
+PLC0415 `import` should be at the top-level of a file
+  --> import_outside_top_level_fix.py:75:5
+   |
+74 | class ClassBody:
+75 |     import string
+   |     ^^^^^^^^^^^^^
+
+PLC0415 `import` should be at the top-level of a file
+  --> import_outside_top_level_fix.py:79:5
+   |
+78 | def relative():
+79 |     from . import sibling
+   |     ^^^^^^^^^^^^^^^^^^^^^
+80 |
+81 |     return sibling
+   |
+
+PLC0415 `import` should be at the top-level of a file
+  --> import_outside_top_level_fix.py:85:5
+   |
+84 | def shadows_builtin():
+85 |     from io import open
+   |     ^^^^^^^^^^^^^^^^^^^
+86 |
+87 |     return open
+   |
+
+PLC0415 `import` should be at the top-level of a file
+  --> import_outside_top_level_fix.py:91:5
+   |
+90 | def rebound_locally():
+91 |     import re
+   |     ^^^^^^^^^
+92 |
+93 |     re = None
+   |
+
+PLC0415 `import` should be at the top-level of a file
+   --> import_outside_top_level_fix.py:98:5
+    |
+ 97 | def deleted_locally():
+ 98 |     import glob
+    |     ^^^^^^^^^^^
+ 99 |
+100 |     del glob
+    |
+
+PLC0415 `import` should be at the top-level of a file
+   --> import_outside_top_level_fix.py:104:5
+    |
+103 | def conflicts_with_module_binding():
+104 |     import pathlib
+    |     ^^^^^^^^^^^^^^
+105 |
+106 |     return pathlib
+    |
+
+PLC0415 `import` should be at the top-level of a file
+   --> import_outside_top_level_fix.py:113:9
+    |
+112 |     def inner():
+113 |         import textwrap
+    |         ^^^^^^^^^^^^^^^
+114 |
+115 |         return textwrap
+    |
+
+PLC0415 `import` should be at the top-level of a file
+   --> import_outside_top_level_fix.py:121:5
+    |
+120 | def partially_imported():
+121 |     import sys, shutil
+    |     ^^^^^^^^^^^^^^^^^^
+122 |
+123 |     return sys, shutil
+    |
+
+PLC0415 `import` should be at the top-level of a file
+   --> import_outside_top_level_fix.py:128:5
+    |
+126 | def global_declaration():
+127 |     global heapq
+128 |     import heapq
+    |     ^^^^^^^^^^^^
+
+PLC0415 `import` should be at the top-level of a file
+   --> import_outside_top_level_fix.py:134:9
+    |
+133 |     def in_conditional_function():
+134 |         import tomllib
+    |         ^^^^^^^^^^^^^^
+135 |
+136 |         return tomllib
+    |
